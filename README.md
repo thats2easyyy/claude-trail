@@ -7,7 +7,7 @@ A Claude Code mod for coming back to a long conversation and not knowing what ha
 - **done**: the big tasks that were finished
 - **outputs**: the screenshots, videos, files and links Claude made
 - **every step**: one line per step, with what it ran, read and edited
-- **waiting on you**: appears only while something waits on you. It lists what the work left for you to do (a command to run, a decision, something to try), each with `[done]`, and any question Claude asked in the pane, which you answer there
+- **waiting on you**: appears only while something waits on you. It lists what the work left for you to do (a command to run, a decision, something to try), each with `[done]`, and any question Claude asked in the pane, which you answer there. The things left for you are also pinned at the top of highlights, so they are the first thing you read
 
 Hover an entry and press `→` to jump to that point in the conversation.
 

@@ -46,7 +46,7 @@ const TASK = 'Background task: '
 export const paneAnswer = (question: string, answer: string): string => `About your question in the Trail pane ("${question}"): ${answer}`
 const PANE_ANSWER = /^About your question in the Trail pane \("[\s\S]*?"\): ([\s\S]+)$/
 
-export const emptyTrail = (): Trail => ({ items: [], feed: [], questions: [], turn: 0, isOpen: false, isFresh: false, lastTool: '', lastAt: 0, recent: [] })
+export const emptyTrail = (): Trail => ({ items: [], feed: [], questions: [], turn: 0, isOpen: false, isFresh: false, lastTool: '', lastAt: 0, recent: [], sought: true })
 
 const emptyWork = (): Work => ({ cmds: 0, reads: 0, edits: 0, agents: 0, other: 0, fails: 0, files: [], moreFiles: 0, extra: [], now: '', notes: [] })
 
@@ -500,6 +500,7 @@ export const mended = (value: unknown): Trail | null => {
     lastTool: typeof from.lastTool === 'string' ? from.lastTool : '',
     lastAt: typeof from.lastAt === 'number' ? from.lastAt : items.reduce((latest, item) => Math.max(latest, item.at), 0),
     recent: Array.isArray(from.recent) ? from.recent.filter((id): id is string => typeof id === 'string') : [],
+    ...(from.sought === true ? { sought: true as const } : {}),
   }
 }
 

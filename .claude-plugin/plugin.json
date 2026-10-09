@@ -1,6 +1,6 @@
 {
   "name": "trail",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A side pane that tells you what happened in a long conversation: short updates as the work goes, the files Claude sent you, big tasks done, and a jump to any point. /trail",
   "author": { "name": "Tyler Nishida" },
   "types": "./types/index.d.ts"

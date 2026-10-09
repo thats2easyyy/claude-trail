@@ -6,7 +6,7 @@ import { captionJob, parseCaptions } from '../hooks/caption.ts'
 import { adopt, feedIn, nextJob, parseBeats, parseCleared } from '../hooks/digest.ts'
 import { candidates, reach } from '../hooks/jump.ts'
 import { eventsFromRows } from '../hooks/rows.ts'
-import { add, ANSWERED_THERE, emptyTrail, firstSentence, MAX_ITEMS, outputType, paneAnswer, promptLine, publishedAt, tag, videosNamed, waitsOf, workLine } from '../hooks/trail.ts'
+import { add, ANSWERED_THERE, emptyTrail, firstSentence, MAX_ITEMS, mended, outputType, paneAnswer, promptLine, publishedAt, tag, videosNamed, waitsOf, workLine } from '../hooks/trail.ts'
 import type { TrailEvent } from '../hooks/trail.ts'
 import { layout, pictureBox, wrap, zoneOf } from '../hooks/view.ts'
 
@@ -475,8 +475,12 @@ test('what the work leaves waiting on the person is listed apart, until a later 
   let told = feedIn(trail, job, beats)
   const look = { width: 58, picked: NOBODY, page: 0, zone: 0 }
   const lines = (from: typeof told, mode: 'feed' | 'done' | 'questions') => layout(from, { ...look, mode }).rows.flatMap(found => (found.kind === 'line' ? [[found.key, found.glyph, found.tone, found.settles]] : []))
-  // It is no update and no task done: it has the view of what waits, with the way to say it is done.
-  expect(lines(told, 'feed')).toEqual([['b:s1', ' ', 'plain', undefined]])
+  // It is no update and no task done. It heads the feed, set apart above the latest of it, and has the view of what waits; in both, the way to say it is done.
+  expect(layout(told, { ...look, mode: 'feed' }).rows.map(found => (found.kind === 'head' ? found.text : found.kind === 'line' ? found.key : found.kind))).toEqual(['Waiting on you', 'w:s1:0', 'day', 'b:s1'])
+  expect(lines(told, 'feed')).toEqual([
+    ['w:s1:0', '○', 'ask', 'w:s1:0'],
+    ['b:s1', ' ', 'plain', undefined],
+  ])
   expect(lines(told, 'done')).toEqual([])
   expect(lines(told, 'questions')).toEqual([['w:s1:0', '○', 'ask', 'w:s1:0']])
   expect(layout(told, { ...look, mode: 'feed' }).foot).toBe('1 update · 1 waiting on you · quiet since Thu Jan 1 00:00')
@@ -510,6 +514,7 @@ test('what the work leaves waiting on the person is listed apart, until a later 
   expect(after.feed.find(beat => beat.id === 'w:s1:0')?.over).toBe(8000)
   expect(waitsOf(after)).toEqual([])
   expect(layout(after, { ...look, mode: 'questions' }).rows).toEqual([])
+  expect(layout(after, { ...look, mode: 'feed' }).rows.some(found => found.kind === 'head')).toBe(false)
   expect(layout(after, { ...look, mode: 'feed' }).foot).toBe('3 updates · quiet since Thu Jan 1 00:00')
 
   // A log of history, with something already told after it, leaves nothing waiting: that was dealt with long since.
@@ -543,6 +548,9 @@ test('a trail read back from its transcript keeps the updates and the answers on
   expect(again.items.find(item => item.id === 's2')?.more).toBe('The boss fight is playable end to end. Two tests are still flaky.')
   expect(again.feed.map(beat => beat.title)).toEqual(['The boss fight was made playable.'])
   expect(nextJob(again)?.isLatest).toBe(true)
+  // A trail told before the mod looked for what waits on the person stays marked so until its latest is told again.
+  const { sought: _, ...before } = asked
+  expect([asked.sought, adopt(built, asked).sought, adopt(built, before).sought, adopt(built, before, true).sought, mended(JSON.parse(JSON.stringify(before)))?.sought]).toEqual([true, true, undefined, true, undefined])
   // Only the turn nobody summarised is left to tell.
   expect(nextJob(kept)?.ids).toEqual(['p0', 's0'])
 })
@@ -935,17 +943,22 @@ test('a thing Claude says is waiting on the person gets the tab for what waits, 
   await clock.advance(5000)
 
   const ui = await $.ui.mount(pane('terminal'))
-  // The pane stays where it was: the tab is there, with its count, and the line under the tabs says so too.
+  // It is the first thing the feed says, under a heading of its own, with the way to say it is done.
+  expect(await ui.find({ type: 'Text', text: /^Waiting on you ─+$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '○ Run `gh auth refresh -s workflow` so the packaging' })).toBeDefined()
+  expect((await ui.find({ key: 'settle:w:row-say:0' }))?.props['label']).toBe('[done]')
+  // The tab for what waits is there too, with its count, and the line under the tabs says so.
   expect((await ui.find({ key: 'tab:questions' }))?.props['label']).toBe('1 waiting on you')
   expect(await ui.find({ type: 'Text', text: /^1 update · 1 waiting on you · quiet since / })).toBeDefined()
-  expect(await ui.find({ key: 'settle:w:row-say:0' })).toBeUndefined()
   await ui.press({ key: 'tab:questions' })
+  expect(await ui.find({ type: 'Text', text: /^Waiting on you ─+$/ })).toBeUndefined()
   expect(await ui.find({ type: 'Text', text: '○ Run `gh auth refresh -s workflow` so the packaging' })).toBeDefined()
   expect((await ui.find({ key: 'settle:w:row-say:0' }))?.props['label']).toBe('[done]')
   expect((await ui.find({ key: 'go:w:row-say:0' }))?.props['label']).toBe('→')
   // Said to be done, it waits no more: the tab goes, and the pane is back at the feed.
   await ui.press({ key: 'settle:w:row-say:0' })
   expect(await ui.find({ key: 'tab:questions' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /^Waiting on you ─+$/ })).toBeUndefined()
   expect(await ui.find({ type: 'Text', text: /^1 update · quiet since / })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'You asked where the branches stand. PR 7 is mergeable;' })).toBeDefined()
   await ui.unmount()

@@ -134,6 +134,12 @@ export type Trail = {
   lastAt: number
   /** Tool calls already counted, newest last: an event seen twice counts once. */
   recent: string[]
+  /**
+   * Its updates are written by a model that also looks for what waits on the
+   * person. Absent on a trail told before the mod looked for that: the latest
+   * of such a trail is read once more.
+   */
+  sought?: true
 }
 
 /** The trail as kept in the session's state and in its file; `v` is the shape's, so one kept by older code is read back from the transcript instead. */

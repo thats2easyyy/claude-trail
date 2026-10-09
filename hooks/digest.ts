@@ -285,8 +285,11 @@ export const adopt = (built: Trail, had: Trail, isRetelling = false): Trail => {
   const notes = new Map(had.items.flatMap(item => (item.shot?.note === undefined ? [] : [[item.id, item.shot.note] as const])))
   const turnOf = new Map(built.items.map(item => [item.id, item.turn]))
   const asked = new Map(had.questions.map(question => [question.id, question]))
+  const { sought: _, ...rest } = built
   return {
-    ...built,
+    ...rest,
+    // What was told before the mod looked for what waits on the person stays so marked until its latest is told again.
+    ...(isRetelling || had.sought ? { sought: true as const } : {}),
     // An update keeps to the step it was tied to, wherever that step's turn now counts from.
     feed: had.feed.map(beat => ({ ...beat, turn: turnOf.get(beat.ref) ?? beat.turn })),
     questions: [...built.questions.map(question => asked.get(question.id) ?? question), ...had.questions.filter(question => !built.questions.some(other => other.id === question.id))].sort((a, b) => a.at - b.at),

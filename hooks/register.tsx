@@ -397,6 +397,8 @@ const begin = async ($: Dollar) => {
     digestSoon($, DIGEST_MS)
     // The module starting again inside a live session comes right after a turn: its pictures can be asked about.
     if (!live.isOpen) captionSoon($)
+    // Told before the mod looked for what waits on the person: its latest is read once more, for that.
+    if (!live.sought) $.clock.after(50, () => void rebuild($, true))
     return
   }
   live = (await load($)) ?? emptyTrail()
@@ -405,7 +407,8 @@ const begin = async ($: Dollar) => {
   await update($, page, () => 0)
   await push($, false)
   // The file may be from before the session went on without the mod; its transcript has all of it.
-  $.clock.after(50, () => void rebuild($).then(why => (why ? $.ui.log(`trail: could not read this session's transcript back (${why}); /trail rebuild tries again`) : undefined)))
+  const isBehind = !live.sought
+  $.clock.after(50, () => void rebuild($, isBehind).then(why => (why ? $.ui.log(`trail: could not read this session's transcript back (${why}); /trail rebuild tries again`) : undefined)))
 }
 
 const ready = async ($: Dollar) => {
@@ -998,6 +1001,13 @@ export const register: Register = on => {
             if (row.kind === 'day') {
               return (
                 <Text dimColor wrap="truncate-end">
+                  {`${row.text} ${'─'.repeat(Math.max(0, width - row.text.length - 1))}`}
+                </Text>
+              )
+            }
+            if (row.kind === 'head') {
+              return (
+                <Text bold wrap="truncate-end">
                   {`${row.text} ${'─'.repeat(Math.max(0, width - row.text.length - 1))}`}
                 </Text>
               )

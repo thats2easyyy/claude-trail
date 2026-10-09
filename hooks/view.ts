@@ -1,8 +1,8 @@
 // What the pane shows, as plain rows: the trail laid out for a width, before any element is made.
 // Pure, so a test or the preview tool can read a page without a terminal.
 
-import type { Item, ItemKind, Mode, OutputType, Picked, Question, Shot, Trail } from '../types'
-import { clip, isOwnOutput, isSent, SENT, waitingCount, workCount, workLine } from './trail.ts'
+import type { Beat, Item, ItemKind, Mode, OutputType, Picked, Question, Shot, Trail } from '../types'
+import { clip, isOwnOutput, isSent, SENT, waitingCount, waitsOf, workCount, workLine } from './trail.ts'
 
 /** What a press on a line jumps to: the transcript row it stands for, and a tool call beside it. */
 export type Target = { id: string; anchor: string; alt?: string; kind: string }
@@ -42,6 +42,12 @@ export type Row =
       picture?: Picture
       /** A thing the work left for the person to do: what `[done]` stops waiting. */
       settles?: string
+    }
+  | {
+      /** The name of a part of the page set apart from the rest: what waits on the person, above the feed. */
+      kind: 'head'
+      key: string
+      text: string
     }
   | {
       kind: 'question'
@@ -85,6 +91,8 @@ const PICTURE_COLUMNS = 64
 const MARK = 2
 /** The widest a line of text is set, in cells: wider is tiring to read. */
 const MEASURE = 72
+/** How the part of the feed that holds what waits on the person is named. */
+export const WAITING_ON_YOU = 'Waiting on you'
 const NOBODYS = /^(Background task\b|Carried on without a new prompt$)/
 
 const GLYPH: Record<ItemKind, string> = { ask: '❯', step: '•', done: '✓', shot: '▣', recap: '≡', compact: '~' }
@@ -322,37 +330,35 @@ export const layout = (trail: Trail, look: Look): Page => {
     })
   }
 
+  const beatRow = (beat: Beat): Row => {
+    const isTask = beat.kind === 'built'
+    const isWait = beat.kind === 'waiting'
+    // A thing done or to do is a line with its mark; an update is a short piece, read across the whole pane.
+    const pad = isTask || isWait ? MARK : 0
+    return {
+      kind: 'line',
+      key: beat.id,
+      target: { id: beat.id, anchor: beat.anchor, kind: isTask ? 'task' : isWait ? 'wait' : 'update', ...(beat.alt ? { alt: beat.alt } : {}) },
+      time: timeOf(beat.at),
+      glyph: isTask ? '✓' : isWait ? '○' : ' ',
+      lines: wrap(beat.detail ? beat.title + ' ' + beat.detail : beat.title, width - pad, UPDATE_LINES),
+      pad,
+      hasMore: false,
+      isOpen: false,
+      work: '',
+      note: noteFor(beat.id),
+      tone: isTask || isWait ? 'ask' : 'plain',
+      ...(isWait ? { settles: beat.id } : {}),
+    }
+  }
   if (look.mode === 'feed' || look.mode === 'done' || look.mode === 'questions') {
     for (const beat of trail.feed) {
       // A big task done is one list's and a thing left with the person another's; the feed is the updates.
       const isTask = beat.kind === 'built'
       const isWait = beat.kind === 'waiting'
       if (isWait ? look.mode !== 'questions' || beat.over !== undefined : isTask !== (look.mode === 'done') || look.mode === 'questions') continue
-      entries.push({
-        at: beat.at,
-        // An update tells of what came before it, pictures included: it sits above them.
-        rank: 3,
-        seq: seq++,
-        row: () => {
-          // A thing done or to do is a line with its mark; an update is a short piece, read across the whole pane.
-          const pad = isTask || isWait ? MARK : 0
-          return {
-            kind: 'line',
-            key: beat.id,
-            target: { id: beat.id, anchor: beat.anchor, kind: isTask ? 'task' : isWait ? 'wait' : 'update', ...(beat.alt ? { alt: beat.alt } : {}) },
-            time: timeOf(beat.at),
-            glyph: isTask ? '✓' : isWait ? '○' : ' ',
-            lines: wrap(beat.detail ? beat.title + ' ' + beat.detail : beat.title, width - pad, UPDATE_LINES),
-            pad,
-            hasMore: false,
-            isOpen: false,
-            work: '',
-            note: noteFor(beat.id),
-            tone: isTask || isWait ? 'ask' : 'plain',
-            ...(isWait ? { settles: beat.id } : {}),
-          }
-        },
-      })
+      // An update tells of what came before it, pictures included: it sits above them.
+      entries.push({ at: beat.at, rank: 3, seq: seq++, row: () => beatRow(beat) })
     }
   }
 
@@ -414,6 +420,9 @@ export const layout = (trail: Trail, look: Look): Page => {
       })
     }
   }
+  // What waits on the person is the first thing the feed says, above the latest of it: it is why the work stopped.
+  const left = look.mode === 'feed' && start === 0 ? waitsOf(trail).reverse() : []
+  if (left.length > 0) rows.push({ kind: 'head', key: 'head:waiting', text: WAITING_ON_YOU }, ...left.map(beatRow))
   let day = ''
   for (const entry of shown) {
     const today = dayOf(entry.at, look.zone)

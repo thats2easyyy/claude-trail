@@ -32,7 +32,7 @@ console.log(page.foot)
 if (page.later > 0) console.log(`[${page.later} later]  [latest]`)
 console.log('')
 for (const row of page.rows) {
-  if (row.kind === 'day') console.log(`${row.text} ${'─'.repeat(Math.max(0, width - row.text.length - 1))}`)
+  if (row.kind === 'day' || row.kind === 'head') console.log(`${row.text} ${'─'.repeat(Math.max(0, width - row.text.length - 1))}`)
   else if (row.kind === 'question') {
     console.log(`Claude is asking you · ${row.time}\n`)
     if (row.picture) box('', row.picture.columns, row.picture.rows)
