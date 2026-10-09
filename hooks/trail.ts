@@ -33,6 +33,8 @@ const RECAP_MAX = 600
 const NOTE_MAX = 320
 /** How much of what was said is kept for a highlight to be written from: all of an answer, the start of a step. */
 const ANSWER_MAX = 1600
+/** Of an answer longer than that, how much is its end: where it says how things stand and what waits on the person. */
+const ANSWER_END = 600
 const STEP_MAX = 320
 const SENTENCE_MIN = 32
 /** A line this long before a list or a break stands on its own. */
@@ -75,6 +77,12 @@ export const isEarlier = (writtenAt: number, beganAt: number): boolean => beganA
  */
 export const isOwnOutput = (item: Item, trail: Trail): boolean =>
   item.kind === 'shot' && item.shot?.from === undefined && !trail.items.some(other => other.kind === 'ask' && other.id === item.anchor)
+
+/** The things the work left for the person to do that they have not done yet, oldest first. */
+export const waitsOf = (trail: Trail): Beat[] => trail.feed.filter(beat => beat.kind === 'waiting' && beat.over === undefined)
+
+/** How many things wait on the person: questions put to them in the pane, and what the work left for them to do. */
+export const waitingCount = (trail: Trail): number => trail.questions.filter(question => question.answer === undefined).length + waitsOf(trail).length
 
 /** How a file Claude handed the person is named in the trail. */
 export const SENT = 'Sent you '
@@ -137,6 +145,14 @@ const plain = (text: string): string =>
       .replace(/`([^`]+)`/g, '$1')
       .replace(/\[([^\]]+)\]\((?:[^)]+)\)/g, '$1'),
   )
+
+/** What is kept of an answer: all of it, or of a long one its start and its end, the middle left out. */
+const headAndEnd = (flat: string): string => {
+  const chars = Array.from(flat)
+  if (chars.length <= ANSWER_MAX) return flat
+  const end = chars.slice(-ANSWER_END).join('')
+  return clip(flat, ANSWER_MAX - ANSWER_END) + ' ' + end.slice(end.indexOf(' ') + 1)
+}
 
 /** Where the first sentence of a plain line ends; a very short one takes the next along. */
 const sentenceEnd = (flat: string): number => {
@@ -364,7 +380,7 @@ const fold = (trail: Trail, event: TrailEvent): Trail => {
           ? change(base.items, before, item => ({ ...item, more: clip(item.more ?? '', STEP_MAX) }))
           : base.items
       const step: Item = { id: event.id, anchor: event.id, kind: 'step', at: event.at, turn: base.turn, line }
-      if (flat.length > line.length) step.more = clip(flat, ANSWER_MAX)
+      if (flat.length > line.length) step.more = headAndEnd(flat)
       if (base.lastTool) step.alt = base.lastTool
       return { ...base, items: thin([...items, step]) }
     }

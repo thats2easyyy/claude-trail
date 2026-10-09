@@ -7,7 +7,7 @@ A Claude Code mod for coming back to a long conversation and not knowing what ha
 - **done**: the big tasks that were finished
 - **outputs**: the screenshots, videos, files and links Claude made
 - **every step**: one line per step, with what it ran, read and edited
-- **question**: appears only while Claude is waiting on an answer from you; answer it in the pane
+- **waiting on you**: appears only while something waits on you. It lists what the work left for you to do (a command to run, a decision, something to try), each with `[done]`, and any question Claude asked in the pane, which you answer there
 
 Hover an entry and press `→` to jump to that point in the conversation.
 
@@ -27,7 +27,7 @@ Answer `y` to add the marketplace, then press Enter to install it for yourself. 
 | --- | --- |
 | `/trail` | Opens the pane |
 | `/trail close` | Closes it, and keeps it closed in new sessions until you type `/trail` |
-| `/trail rebuild` | Reads the whole conversation again from its transcript |
+| `/trail rebuild` | Reads the whole conversation again from its transcript, and looks again at the latest of it for what is waiting on you |
 | `/trail where` | Says where this session's trail is kept |
 
 In a terminal at least 144 columns wide the pane opens by itself when a session starts. A conversation that began before you installed the mod is read back from its transcript the next time you resume it.

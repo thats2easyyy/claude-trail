@@ -2,10 +2,10 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import type { Beat, Mode, OutputType, Picked, Question, Saved, Shot, Source, Trail } from '../types'
-import { adopt, feedIn, nextJob, parseBeats, SYSTEM } from './digest.ts'
+import { adopt, feedIn, nextJob, parseBeats, parseCleared, SYSTEM } from './digest.ts'
 import { captionJob, parseCaptions } from './caption.ts'
 import { candidates, reach } from './jump.ts'
-import { add, basename, clean, emptyTrail, isEarlier, mended, outputType, paneAnswer, publishedAt, SENT, tag, toolNote, videosNamed } from './trail.ts'
+import { add, basename, clean, emptyTrail, isEarlier, mended, outputType, paneAnswer, publishedAt, SENT, tag, toolNote, videosNamed, waitingCount } from './trail.ts'
 import type { TrailEvent } from './trail.ts'
 import { clock, layout, zoneOf } from './view.ts'
 import type { Target } from './view.ts'
@@ -241,6 +241,7 @@ const digest = async ($: Dollar): Promise<number | null> => {
   isDigesting = true
   try {
     let beats: Beat[] = []
+    let cleared: string[] = []
     if (job.prompt) {
       await tell($, 'writing the latest update…')
       const reply = await complete($, job.prompt)
@@ -251,13 +252,14 @@ const digest = async ($: Dollar): Promise<number | null> => {
         return DIGEST_RETRY_MS
       }
       beats = parseBeats(reply, job)
+      cleared = parseCleared(reply, job)
       if (beats.length === 0) {
         for (const id of job.ids) skipped.add(id)
         jot(diag.digests, `unreadable reply: ${reply.slice(0, 160)}`)
         return DIGEST_NEXT_MS
       }
     }
-    live = feedIn(live, job, beats)
+    live = feedIn(live, job, beats, cleared)
     await push($, true)
     return DIGEST_NEXT_MS
   } catch (error) {
@@ -333,9 +335,11 @@ const load = async ($: Dollar): Promise<Trail | null> => {
  * Reads the session's transcript file back into a trail, pictures included: a
  * host command, since the file is far larger than a mod may read. What only
  * the mod knew (the updates written so far, the answers given in the pane)
- * is carried over. Resolves why not when it could not ('' when it did).
+ * is carried over. Asked for by the person, the latest of it is put to the
+ * model again, which is how a session told before the mod knew to look finds
+ * what is waiting on them. Resolves why not when it could not ('' when it did).
  */
-const rebuild = async ($: Dollar): Promise<string> => {
+const rebuild = async ($: Dollar, isAsked = false): Promise<string> => {
   if (isRebuilding) return 'already rebuilding'
   const [of, into] = [sid, dir]
   if (!of || !into) return 'no session yet'
@@ -351,7 +355,7 @@ const rebuild = async ($: Dollar): Promise<string> => {
     else if (of !== sid) why = 'the session changed meanwhile'
     else if (!built) why = 'nothing readable was written'
     else {
-      live = journal.reduce(add, adopt(built, had))
+      live = journal.reduce(add, adopt(built, had, isAsked))
       await push($, true)
     }
     jot(diag.rebuilds, why || ran.stdout.trim().slice(0, 300))
@@ -709,13 +713,25 @@ const answer = async ($: Dollar, question: Question, text: string) => {
     if (!said || answered.has(question.id)) return
     answered.add(question.id)
     await record($, now => ({ t: 'answer', id: question.id, at: now, text: said }))
-    // With nothing left to answer the pane goes back to the feed.
-    if (!live.questions.some(other => other.answer === undefined)) await update($, mode, now => (now === ASKING ? 'feed' : now))
+    // With nothing left waiting the pane goes back to the feed.
+    if (waitingCount(live) === 0) await update($, mode, now => (now === ASKING ? 'feed' : now))
     await push($, true)
     jot(diag.questions, `answered ${question.id}`)
     await $.prompt.submit({ text: paneAnswer(question.text, said), asUser: true })
   } catch (error) {
     fault($, 'answer', error)
+  }
+}
+
+/** The person says a thing the work left for them is done: it stops waiting. */
+const settle = async ($: Dollar, id: string) => {
+  try {
+    const now = await $.clock.now()
+    live = { ...live, feed: live.feed.map(beat => (beat.id === id && beat.over === undefined ? { ...beat, over: now } : beat)) }
+    if (waitingCount(live) === 0) await update($, mode, at => (at === ASKING ? 'feed' : at))
+    await push($, true)
+  } catch (error) {
+    fault($, 'settle', error)
   }
 }
 
@@ -767,7 +783,7 @@ const turnPage = async ($: Dollar, by: number) => {
   }
 }
 
-/** The view for the questions waiting on the person: among the tabs only while there are any. */
+/** The view for what waits on the person, questions and things left for them to do: among the tabs only while something does. */
 const ASKING: Mode = 'questions'
 
 const EMPTY_VIEW: Record<Mode, string> = {
@@ -831,7 +847,7 @@ export const register: Register = on => {
     }
     if (verb === 'where') return { text: `Trail keeps this session in ${dir}` }
     if (verb === 'rebuild') {
-      const why = await rebuild($)
+      const why = await rebuild($, true)
       if (why) return { text: `Trail could not read the transcript back: ${why}` }
     } else if (verb !== '' && verb !== 'open') return { text: USAGE }
 
@@ -944,9 +960,9 @@ export const register: Register = on => {
     const back = await read($, page)
     const kind = await read($, mode)
     const trail = mended(kept.trail) ?? emptyTrail()
-    const waiting = trail.questions.filter(question => question.answer === undefined).length
-    // The questions' tab is there only while one waits; answered elsewhere, the pane is back at the feed.
-    const tabs = waiting > 0 ? [{ mode: ASKING, label: waiting === 1 ? '1 question' : `${waiting} questions` }, ...TABS] : TABS
+    const waiting = waitingCount(trail)
+    // The tab for what waits on the person is there only while something does; with nothing left, the pane is back at the feed.
+    const tabs = waiting > 0 ? [{ mode: ASKING, label: `${waiting} waiting on you` }, ...TABS] : TABS
     const listing: Mode = tabs.some(tab => tab.mode === kind) ? kind : 'feed'
     const doing = await read($, status)
     // A cell of margin each side keeps the words off the pane's frame.
@@ -1015,7 +1031,7 @@ export const register: Register = on => {
                 </Box>
               )
             }
-            const { target, open, picture } = row
+            const { target, open, picture, settles } = row
             const isAsk = row.tone === 'ask'
             const isQuiet = row.tone === 'quiet'
             const pad = ' '.repeat(row.pad)
@@ -1025,6 +1041,7 @@ export const register: Register = on => {
                   <Text dimColor>{row.time}</Text>
                   {open && <Button key={`open:${row.key}`} plain dimColor label="[open]" onPress={() => void openPicture($, open)} />}
                   {row.hasMore && <Button key={`more:${row.key}`} plain dimColor label={row.isOpen ? '[less]' : '[more]'} onPress={() => void unfold($, target)} />}
+                  {settles && <Button key={`settle:${row.key}`} plain dimColor label="[done]" onPress={() => void settle($, settles)} />}
                   <Box display="none" hover={{ display: 'flex' }}>
                     <Button key={`go:${row.key}`} plain label={GO} onPress={() => void jump($, target)} />
                   </Box>

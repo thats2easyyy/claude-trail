@@ -75,9 +75,11 @@ export type Item = {
  * something `found` out, something `decided`, a `problem` met, one `fixed`,
  * something `checked` and how it came out, something `asked` of the person
  * (it waits on them), or a plain `note`. A `summary` is not one thing but
- * what a whole request came to, in a few sentences.
+ * what a whole request came to, in a few sentences. Something `waiting` is
+ * not a telling at all: it is a thing the work left for the person to do,
+ * listed apart until it is done.
  */
-export type BeatKind = 'summary' | 'built' | 'found' | 'decided' | 'problem' | 'fixed' | 'checked' | 'asked' | 'note'
+export type BeatKind = 'summary' | 'built' | 'waiting' | 'found' | 'decided' | 'problem' | 'fixed' | 'checked' | 'asked' | 'note'
 
 /** One update of the feed: what was done in a stretch of work and what came of it, in a few sentences, tied to the row where the stretch ended. */
 export type Beat = {
@@ -95,6 +97,8 @@ export type Beat = {
   /** The transcript row a click scrolls to, and a tool call beside it. */
   anchor: string
   alt?: string
+  /** Of something waiting on the person: when it stopped waiting, done or no longer needed. Absent while it waits. */
+  over?: number
 }
 
 /**
@@ -146,8 +150,10 @@ export type Picked = { id: string; jump?: string; isOpen?: boolean }
 /**
  * What the pane lists: the feed of updates (its highlights), what Claude
  * sent the person (files it handed over, pages it published), the big tasks
- * done, everything the work produced, every step as it happened, or the
- * questions waiting on the person, which is a view only while there are any.
+ * done, everything the work produced, every step as it happened, or what
+ * waits on the person (`questions`: the questions Claude put to them in the
+ * pane and the things the work left for them to do), which is a view only
+ * while something does.
  */
 export type Mode = 'feed' | 'sent' | 'done' | 'outputs' | 'steps' | 'questions'
 

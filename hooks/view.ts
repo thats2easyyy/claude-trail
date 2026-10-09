@@ -2,7 +2,7 @@
 // Pure, so a test or the preview tool can read a page without a terminal.
 
 import type { Item, ItemKind, Mode, OutputType, Picked, Question, Shot, Trail } from '../types'
-import { clip, isOwnOutput, isSent, SENT, workCount, workLine } from './trail.ts'
+import { clip, isOwnOutput, isSent, SENT, waitingCount, workCount, workLine } from './trail.ts'
 
 /** What a press on a line jumps to: the transcript row it stands for, and a tool call beside it. */
 export type Target = { id: string; anchor: string; alt?: string; kind: string }
@@ -40,6 +40,8 @@ export type Row =
       open?: string
       /** An output's entry: its picture, when it is one of those drawn. */
       picture?: Picture
+      /** A thing the work left for the person to do: what `[done]` stops waiting. */
+      settles?: string
     }
   | {
       kind: 'question'
@@ -235,14 +237,14 @@ const counted = (count: number, one: string, many: string): string => count + ' 
 const footOf = (trail: Trail, look: Look): string => {
   const steps = trail.items.filter(item => item.kind === 'step' || item.kind === 'done').length
   const outputs = trail.items.filter(item => isOwnOutput(item, trail)).length
-  const waiting = trail.questions.filter(question => question.answer === undefined).length
-  const told = trail.feed.filter(beat => beat.kind !== 'built').length
-  const tasks = trail.feed.length - told
+  const waiting = waitingCount(trail)
+  const told = trail.feed.filter(beat => beat.kind !== 'built' && beat.kind !== 'waiting').length
+  const tasks = trail.feed.filter(beat => beat.kind === 'built').length
   const parts =
     look.mode === 'questions'
       ? []
       : [look.mode === 'sent' ? trail.items.filter(isSent).length + ' sent to you' : look.mode === 'feed' ? counted(told, 'update', 'updates') : look.mode === 'done' ? counted(tasks, 'big task done', 'big tasks done') : look.mode === 'outputs' ? counted(outputs, 'output', 'outputs') : counted(steps, 'step', 'steps')]
-  if (waiting > 0) parts.push(waiting + (waiting === 1 ? ' question for you' : ' questions for you'))
+  if (waiting > 0) parts.push(waiting + ' waiting on you')
   const last = Math.max(trail.lastAt, trail.items.reduce((latest, item) => Math.max(latest, item.at), 0))
   // The day, not how long ago: the pane may sit undrawn for a night, and an age would go stale in it.
   if (trail.isOpen) parts.push('working now')
@@ -320,32 +322,34 @@ export const layout = (trail: Trail, look: Look): Page => {
     })
   }
 
-  if (look.mode === 'feed' || look.mode === 'done') {
+  if (look.mode === 'feed' || look.mode === 'done' || look.mode === 'questions') {
     for (const beat of trail.feed) {
-      // A big task done is the other list's; the feed is the updates.
+      // A big task done is one list's and a thing left with the person another's; the feed is the updates.
       const isTask = beat.kind === 'built'
-      if (isTask !== (look.mode === 'done')) continue
+      const isWait = beat.kind === 'waiting'
+      if (isWait ? look.mode !== 'questions' || beat.over !== undefined : isTask !== (look.mode === 'done') || look.mode === 'questions') continue
       entries.push({
         at: beat.at,
         // An update tells of what came before it, pictures included: it sits above them.
         rank: 3,
         seq: seq++,
         row: () => {
-          // A thing done is a line with its mark; an update is a short piece, read across the whole pane.
-          const pad = isTask ? MARK : 0
+          // A thing done or to do is a line with its mark; an update is a short piece, read across the whole pane.
+          const pad = isTask || isWait ? MARK : 0
           return {
             kind: 'line',
             key: beat.id,
-            target: { id: beat.id, anchor: beat.anchor, kind: isTask ? 'task' : 'update', ...(beat.alt ? { alt: beat.alt } : {}) },
+            target: { id: beat.id, anchor: beat.anchor, kind: isTask ? 'task' : isWait ? 'wait' : 'update', ...(beat.alt ? { alt: beat.alt } : {}) },
             time: timeOf(beat.at),
-            glyph: isTask ? '✓' : ' ',
+            glyph: isTask ? '✓' : isWait ? '○' : ' ',
             lines: wrap(beat.detail ? beat.title + ' ' + beat.detail : beat.title, width - pad, UPDATE_LINES),
             pad,
             hasMore: false,
             isOpen: false,
             work: '',
             note: noteFor(beat.id),
-            tone: isTask ? 'ask' : 'plain',
+            tone: isTask || isWait ? 'ask' : 'plain',
+            ...(isWait ? { settles: beat.id } : {}),
           }
         },
       })

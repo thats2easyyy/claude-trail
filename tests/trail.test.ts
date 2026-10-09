@@ -3,10 +3,10 @@ import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import { captionJob, parseCaptions } from '../hooks/caption.ts'
-import { adopt, feedIn, nextJob, parseBeats } from '../hooks/digest.ts'
+import { adopt, feedIn, nextJob, parseBeats, parseCleared } from '../hooks/digest.ts'
 import { candidates, reach } from '../hooks/jump.ts'
 import { eventsFromRows } from '../hooks/rows.ts'
-import { add, ANSWERED_THERE, emptyTrail, firstSentence, MAX_ITEMS, outputType, paneAnswer, promptLine, publishedAt, tag, videosNamed, workLine } from '../hooks/trail.ts'
+import { add, ANSWERED_THERE, emptyTrail, firstSentence, MAX_ITEMS, outputType, paneAnswer, promptLine, publishedAt, tag, videosNamed, waitsOf, workLine } from '../hooks/trail.ts'
 import type { TrailEvent } from '../hooks/trail.ts'
 import { layout, pictureBox, wrap, zoneOf } from '../hooks/view.ts'
 
@@ -453,6 +453,80 @@ test('a question with no work in it needs no model, and a long run is told of a 
   expect(parseBeats('1|First half ported.\n2|Second half ported; all nine parts compile.', whole).map(beat => beat.ref)).toEqual(['s3', 's8'])
 })
 
+test('what the work leaves waiting on the person is listed apart, until a later log shows it done', () => {
+  const RUN = 'Run `gh auth refresh -s workflow` so the packaging branch can be pushed.'
+  const trail = folded([
+    { t: 'prompt', id: 'p1', at: 1000, text: 'where do the branches stand?' },
+    { t: 'say', id: 's1', at: 2000, text: 'PR 7 passed CI and is mergeable. The packaging branch waits on you running `gh auth refresh -s workflow`.' },
+    { t: 'end', at: 3000 },
+  ])
+  // An answer that may leave something with the person is read by a model, though no work was done in it.
+  const job = nextJob(trail)!
+  expect(job.prompt).toContain('final answer: PR 7 passed CI')
+  expect([job.isLatest, job.open, job.local]).toEqual([true, [], undefined])
+  const reply = ['1|PR 7 passed CI and is mergeable; the packaging branch is held up.', `wait|1|${RUN}`, 'wait|9|There is no ninth stretch', 'clear|w1'].join('\n')
+  const beats = parseBeats(reply, job)
+  expect(beats.map(beat => [beat.id, beat.kind, beat.title, beat.anchor])).toEqual([
+    ['b:s1', 'summary', 'PR 7 passed CI and is mergeable; the packaging branch is held up.', 's1'],
+    ['w:s1:0', 'waiting', RUN, 's1'],
+  ])
+  // Nothing was named as still waiting, so there is nothing to clear.
+  expect(parseCleared(reply, job)).toEqual([])
+  let told = feedIn(trail, job, beats)
+  const look = { width: 58, picked: NOBODY, page: 0, zone: 0 }
+  const lines = (from: typeof told, mode: 'feed' | 'done' | 'questions') => layout(from, { ...look, mode }).rows.flatMap(found => (found.kind === 'line' ? [[found.key, found.glyph, found.tone, found.settles]] : []))
+  // It is no update and no task done: it has the view of what waits, with the way to say it is done.
+  expect(lines(told, 'feed')).toEqual([['b:s1', ' ', 'plain', undefined]])
+  expect(lines(told, 'done')).toEqual([])
+  expect(lines(told, 'questions')).toEqual([['w:s1:0', '○', 'ask', 'w:s1:0']])
+  expect(layout(told, { ...look, mode: 'feed' }).foot).toBe('1 update · 1 waiting on you · quiet since Thu Jan 1 00:00')
+
+  // While it waits, every exchange is read by a model, and the log opens with what waits; said again, it is listed once.
+  told = (
+    [
+      { t: 'prompt', id: 'p2', at: 4000, text: 'ok' },
+      { t: 'say', id: 's2', at: 5000, text: 'Nothing has changed since.' },
+      { t: 'end', at: 6000 },
+    ] as TrailEvent[]
+  ).reduce(add, told)
+  const next = nextJob(told)!
+  expect(next.prompt.startsWith(`STILL WAITING ON THE PERSON FROM BEFORE THIS LOG:\nw1: ${RUN}\n\nTHE PERSON ASKED:\nok`)).toBe(true)
+  expect(next.open).toEqual(['w:s1:0'])
+  told = feedIn(told, next, parseBeats(`1|Nothing changed.\nwait|1|${RUN.toLowerCase()}`, next), [])
+  expect(waitsOf(told).map(beat => beat.id)).toEqual(['w:s1:0'])
+
+  // A later log that shows it done clears it by its mark, as of that log's last step.
+  told = (
+    [
+      { t: 'prompt', id: 'p3', at: 7000, text: 'I ran it' },
+      { t: 'say', id: 's3', at: 8000, text: 'The packaging branch is pushed.' },
+      { t: 'end', at: 9000 },
+    ] as TrailEvent[]
+  ).reduce(add, told)
+  const last = nextJob(told)!
+  const done = '1|You ran the command and Claude pushed the packaging branch.\nclear|w1\nclear|w7'
+  expect(parseCleared(done, last)).toEqual(['w:s1:0'])
+  const after = feedIn(told, last, parseBeats(done, last), parseCleared(done, last))
+  expect(after.feed.find(beat => beat.id === 'w:s1:0')?.over).toBe(8000)
+  expect(waitsOf(after)).toEqual([])
+  expect(layout(after, { ...look, mode: 'questions' }).rows).toEqual([])
+  expect(layout(after, { ...look, mode: 'feed' }).foot).toBe('3 updates · quiet since Thu Jan 1 00:00')
+
+  // A log of history, with something already told after it, leaves nothing waiting: that was dealt with long since.
+  const two = folded([
+    { t: 'prompt', id: 'p1', at: 1000, text: 'which do you want?' },
+    { t: 'say', id: 's1', at: 2000, text: 'Tell me which of the two you want.' },
+    { t: 'end', at: 3000 },
+    { t: 'prompt', id: 'p2', at: 4000, text: 'the first' },
+    { t: 'say', id: 's2', at: 5000, text: 'Done with the first.' },
+    { t: 'end', at: 6000 },
+  ])
+  const caughtUp = { ...two, items: two.items.map(item => (item.turn === 2 ? { ...item, fed: true as const } : item)) }
+  const old = nextJob(caughtUp)!
+  expect([old.ids, old.isLatest]).toEqual([['p1', 's1'], false])
+  expect(waitsOf(feedIn(caughtUp, old, parseBeats('1|Claude asked which of the two you wanted.\nwait|1|Say which of the two you want', old)))).toEqual([])
+})
+
 test('a trail read back from its transcript keeps the updates and the answers only the mod knew', () => {
   const had = feedIn(folded(WORKED), nextJob(folded(WORKED))!, [{ id: 'b:s2', ref: 's2', turn: 1, at: 7000, kind: 'summary', title: 'The boss fight was made playable.', detail: '', anchor: 's2' }])
   const asked = add(add(had, { t: 'question', id: 'q1', at: 9500, text: 'Ship it?', options: ['Yes', 'No'] }), { t: 'answer', id: 'q1', at: 9600, text: 'Yes' })
@@ -463,6 +537,12 @@ test('a trail read back from its transcript keeps the updates and the answers on
   expect(kept.feed.map(beat => [beat.title, beat.turn])).toEqual([['The boss fight was made playable.', 2]])
   expect(kept.items.filter(item => item.fed).map(item => item.id)).toEqual(['p1', 's1', 't4:shot', 's2'])
   expect(kept.questions).toMatchObject([{ id: 'q1', answer: 'Yes' }])
+  // Asked to tell the latest again, the newest turns are left untold with all they said, and their updates stand.
+  const again = adopt(built, asked, true)
+  expect(again.items.filter(item => item.fed)).toEqual([])
+  expect(again.items.find(item => item.id === 's2')?.more).toBe('The boss fight is playable end to end. Two tests are still flaky.')
+  expect(again.feed.map(beat => beat.title)).toEqual(['The boss fight was made playable.'])
+  expect(nextJob(again)?.isLatest).toBe(true)
   // Only the turn nobody summarised is left to tell.
   expect(nextJob(kept)?.ids).toEqual(['p0', 's0'])
 })
@@ -653,12 +733,12 @@ test('the page reads from the latest back, by the clock: questions waiting, then
   const now = feed.rows.find(found => found.kind === 'line' && found.key === 's3')
   expect(now?.kind === 'line' && [now.glyph, now.tone, now.work]).toEqual(['…', 'quiet', ''])
   expect(feed.rows.some(found => found.kind === 'question')).toBe(false)
-  expect(feed.foot).toBe('1 update · 1 question for you · working now')
+  expect(feed.foot).toBe('1 update · 1 waiting on you · working now')
   const asking = layout(trail, { ...look, mode: 'questions' })
   expect(asking.rows.map(found => found.kind)).toEqual(['question'])
   const question = asking.rows[0]
   expect(question?.kind === 'question' && [question.lines, question.picture?.columns]).toEqual([['Is this the ending you wanted?'], 45])
-  expect(asking.foot).toBe('1 question for you · working now')
+  expect(asking.foot).toBe('1 waiting on you · working now')
 
   // Answered, the question is a thing that happened: told among the steps with what was said, and nothing waits.
   const after = add(trail, { t: 'answer', id: 'q1', at: at('03:08:00'), text: 'Yes' })
@@ -844,6 +924,33 @@ test('a video a command makes and a file Claude sends show among the outputs, ea
   await ui.unmount()
 })
 
+test('a thing Claude says is waiting on the person gets the tab for what waits, and [done] takes it away', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  engine(on, '1|You asked where the branches stand. PR 7 is mergeable; the packaging branch is held up.\nwait|1|Run `gh auth refresh -s workflow` so the packaging branch can be pushed', '')
+
+  await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+  await appended($.session.append(ask('row-ask', 'where do the branches stand?')))
+  await appended($.session.append(say('row-say', 'PR 7 is mergeable. The packaging branch waits on you running `gh auth refresh -s workflow`.')))
+  await $.turn.complete({ answer: 'PR 7 is mergeable.', durationMs: 5, isAborted: false, turnId: 't1', reason: 'answer' })
+  await clock.advance(5000)
+
+  const ui = await $.ui.mount(pane('terminal'))
+  // The pane stays where it was: the tab is there, with its count, and the line under the tabs says so too.
+  expect((await ui.find({ key: 'tab:questions' }))?.props['label']).toBe('1 waiting on you')
+  expect(await ui.find({ type: 'Text', text: /^1 update · 1 waiting on you · quiet since / })).toBeDefined()
+  expect(await ui.find({ key: 'settle:w:row-say:0' })).toBeUndefined()
+  await ui.press({ key: 'tab:questions' })
+  expect(await ui.find({ type: 'Text', text: '○ Run `gh auth refresh -s workflow` so the packaging' })).toBeDefined()
+  expect((await ui.find({ key: 'settle:w:row-say:0' }))?.props['label']).toBe('[done]')
+  expect((await ui.find({ key: 'go:w:row-say:0' }))?.props['label']).toBe('→')
+  // Said to be done, it waits no more: the tab goes, and the pane is back at the feed.
+  await ui.press({ key: 'settle:w:row-say:0' })
+  expect(await ui.find({ key: 'tab:questions' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /^1 update · quiet since / })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'You asked where the branches stand. PR 7 is mergeable;' })).toBeDefined()
+  await ui.unmount()
+})
+
 test('Claude asks in the pane, under a picture; the answer pressed there goes back as the person’s next message', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const { ran, sent } = engine(on)
@@ -858,7 +965,7 @@ test('Claude asks in the pane, under a picture; the answer pressed there goes ba
 
   // The pane has turned to the question: a view of its own, there because something waits.
   const ui = await $.ui.mount(pane('terminal'))
-  expect(await ui.find({ type: 'Text', text: /^ 1 question $/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^ 1 waiting on you $/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /Claude is asking you/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'Is this the garage where you put the letter H?' })).toBeDefined()
   expect((await ui.find({ type: 'Image' }))?.props['source']).toEqual({ file: `${DIR}/shots/q-toolu_q.png`, format: 'png' })
@@ -866,7 +973,7 @@ test('Claude asks in the pane, under a picture; the answer pressed there goes ba
   // The other views do not show it; its tab stays among theirs while it waits.
   await ui.press({ key: 'tab:feed' })
   expect(await ui.find({ type: 'Text', text: /Claude is asking you/ })).toBeUndefined()
-  expect((await ui.find({ key: 'tab:questions' }))?.props['label']).toBe('1 question')
+  expect((await ui.find({ key: 'tab:questions' }))?.props['label']).toBe('1 waiting on you')
   await ui.press({ key: 'tab:questions' })
 
   await ui.press({ key: 'answer:toolu_q:0' })

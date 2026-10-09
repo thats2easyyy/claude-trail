@@ -1,5 +1,5 @@
 // Prints a kept trail as the pane would lay it out, to read one without a terminal:
-//   node tools/preview.ts <dir holding trail.json | trail.json> [columns] [feed|done|outputs|steps] [page]
+//   node tools/preview.ts <dir holding trail.json | trail.json> [columns] [feed|sent|done|outputs|steps|questions] [page]
 import { readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 
@@ -9,7 +9,7 @@ import { layout } from '../hooks/view.ts'
 const [where, columns = '58', listing = 'feed', back = '0'] = process.argv.slice(2)
 const MODES = ['feed', 'sent', 'done', 'outputs', 'steps', 'questions'] as const
 if (!where) {
-  console.error('usage: node tools/preview.ts <dir holding trail.json | trail.json> [columns] [feed|done|outputs|steps] [page]')
+  console.error('usage: node tools/preview.ts <dir holding trail.json | trail.json> [columns] [feed|sent|done|outputs|steps|questions] [page]')
   process.exit(2)
 }
 const path = statSync(where).isDirectory() ? join(where, 'trail.json') : where
@@ -41,7 +41,7 @@ for (const row of page.rows) {
     console.log('\n> Type your answer')
   } else {
     const pad = ' '.repeat(row.pad)
-    console.log(`${row.time}${row.open ? '  [open]' : ''}${row.hasMore ? (row.isOpen ? '  [less]' : '  [more]') : ''}`)
+    console.log(`${row.time}${row.open ? '  [open]' : ''}${row.hasMore ? (row.isOpen ? '  [less]' : '  [more]') : ''}${row.settles ? '  [done]' : ''}`)
     row.lines.forEach((text, index) => console.log(index === 0 && row.pad > 0 ? `${row.glyph} ${text}` : pad + text))
     if (row.work) console.log(`${pad}└ ${row.work}`)
     if (row.picture) {
