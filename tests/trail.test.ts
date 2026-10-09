@@ -5,6 +5,7 @@ import type { On } from 'claude-code'
 import { captionJob, parseCaptions } from '../hooks/caption.ts'
 import { adopt, feedIn, nextJob, parseBeats, parseCleared } from '../hooks/digest.ts'
 import { candidates, reach } from '../hooks/jump.ts'
+import { keepDays, prunable, sized, staleCopies } from '../hooks/prune.ts'
 import { eventsFromRows } from '../hooks/rows.ts'
 import { add, ANSWERED_THERE, emptyTrail, firstSentence, MAX_ITEMS, mended, outputType, paneAnswer, promptLine, publishedAt, tag, videosNamed, waitsOf, workLine } from '../hooks/trail.ts'
 import type { TrailEvent } from '../hooks/trail.ts'
@@ -60,6 +61,9 @@ function engine(on: On, reply = '', captions = '') {
   const forked: string[] = []
   /** Files a command is taken to have just written. */
   const made = new Set<string>()
+  /** What a folder is listed as holding, and when files other than those were last written. */
+  const listed = new Map<string, { name: string; kind: 'file' | 'dir' | 'other'; size: number; mtimeMs: number; isLink: boolean }[]>()
+  const written = new Map<string, number>()
   mock.env(on, { HOME })
   mock.store(on, {})
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
@@ -103,14 +107,18 @@ function engine(on: On, reply = '', captions = '') {
   })
   on('turn.complete', () => ({ text: '' }))
   on('session.cwd', () => ({ value: '/work' }))
-  on('fs.stat', (_$, e) => (made.has(e.path) ? { value: { kind: 'file', size: 9000, mtimeMs: NOW + 500, isLink: false } } : { deny: 'no such file' }))
+  on('fs.stat', (_$, e) =>
+    made.has(e.path) ? { value: { kind: 'file', size: 9000, mtimeMs: NOW + 500, isLink: false } } : written.has(e.path) ? { value: { kind: 'file', size: 100, mtimeMs: written.get(e.path) ?? 0, isLink: false } } : { deny: 'no such file' },
+  )
+  on('fs.list', (_$, e) => ({ value: listed.get(e.path) ?? [] }))
+  on('settings.read', () => ({ value: {} }))
   on('tool.call', (_$, e) => {
     if (e.tool === 'Read' && String(e.file_path).endsWith('.png')) return { result: { type: 'image', file: { base64: '', type: 'image/png', originalSize: 10, dimensions: { originalWidth: 1440, originalHeight: 900 } } } }
     if (e.tool === 'SendUserFile') return { result: { attachments: [{ path: '/work/out/demo.mp4', size: 9000, isImage: false }] }, text: '1 file delivered to user.' }
     return { result: { stdout: '', stderr: '', interrupted: false }, text: '' }
   })
 
-  return { files, ran, sent, asked, forked, made }
+  return { files, ran, sent, asked, forked, made, listed, written }
 }
 
 /** A row as the engine appends it: what the model said, what the person asked, or a command they typed. */
@@ -616,7 +624,7 @@ test('whatever the work produced is an output: pictures, the videos a command ma
   ])
   const page = layout(trail, { width: 58, picked: NOBODY, page: 0, mode: 'outputs', zone: 0 })
   // Only the outputs, newest first, each with the way to open it; every one that has a picture is drawn.
-  expect(page.rows.flatMap(found => (found.kind === 'line' ? [[found.glyph, found.lines[0], found.open]] : []))).toEqual([
+  expect(page.rows.flatMap(found => (found.kind === 'line' ? [[found.glyph, found.lines[0], found.open?.full]] : []))).toEqual([
     ['↗', 'Published index.html', 'https://claude.ai/artifact/Wi2rD8'],
     ['▤', 'Sent you notes.pdf', '/work/notes.pdf'],
     ['▶', 'film.mp4', '/work/out/film.mp4'],
@@ -719,7 +727,7 @@ test('the page reads from the latest back, by the clock: questions waiting, then
   // Every entry has the same shape in every view: its mark, and its words set in by the mark's width under the first row.
   expect([...new Set(steps.rows.flatMap(found => (found.kind === 'line' ? [found.pad] : [])))]).toEqual([2])
   // Of two pictures taken one after the other the last is drawn; each entry says where its whole picture is.
-  expect(steps.rows.flatMap(found => (found.kind === 'line' && found.open ? [found.open] : []))).toEqual(['/shots/b.png', '/shots/a.full.png'])
+  expect(steps.rows.flatMap(found => (found.kind === 'line' && found.open ? [found.open.full || found.open.file] : []))).toEqual(['/shots/b.png', '/shots/a.full.png'])
   expect(steps.foot).toBe('3 steps · working now')
 
   // The feed is the updates and the pictures, and nothing else: no requests, no steps but the latest still untold.
@@ -783,6 +791,31 @@ test('a long trail pages from the newest back, every line once', () => {
   expect(keysOf(3).at(-1)).toBe('p0')
 })
 
+test('what is past keeping: the pictures of a session idle a week, the folder of one idle as long as a transcript is kept', () => {
+  const DAY = 86_400_000
+  const id = (n: number) => `00000000-0000-4000-8000-00000000000${n}`
+  const kept = [
+    { name: id(1), touchedAt: NOW - 2 * DAY, hasShots: true },
+    { name: id(2), touchedAt: NOW - 8 * DAY, hasShots: true },
+    { name: id(3), touchedAt: NOW - 8 * DAY, hasShots: false },
+    { name: id(4), touchedAt: NOW - 31 * DAY, hasShots: true },
+    // This session's own, however old; a folder whose age is not known; one that is no session's.
+    { name: id(5), touchedAt: NOW - 90 * DAY, hasShots: true },
+    { name: id(6), touchedAt: 0, hasShots: true },
+    { name: 'notes', touchedAt: NOW - 90 * DAY, hasShots: true },
+    { name: '../../etc', touchedAt: NOW - 90 * DAY, hasShots: true },
+  ]
+  expect(prunable(kept, NOW, id(5), 30)).toEqual({ folders: [id(4)], pictures: [id(2)] })
+  // A person who keeps transcripts longer keeps their trails as long; one who keeps them three days, no longer than that.
+  expect(prunable(kept, NOW, id(5), 365)).toEqual({ folders: [], pictures: [id(2), id(4)] })
+  expect(prunable(kept, NOW, id(5), 3)).toEqual({ folders: [id(2), id(3), id(4)], pictures: [] })
+  expect([keepDays(undefined), keepDays(90), keepDays(0), keepDays('7'), keepDays(2.9)]).toEqual([30, 90, 30, 30, 2])
+  expect([sized(12), sized(2048), sized(146_000), sized(3_400_000)]).toEqual(['12 KB', '2 MB', '143 MB', '3.2 GB'])
+  // A whole-size copy goes a week after it was made; the small copy beside it, and anything not named as a copy, stays.
+  const file = (name: string, days: number, kind = 'file') => ({ name, kind, mtimeMs: NOW - days * DAY })
+  expect(staleCopies([file('toolu_1.full.png', 8), file('toolu_1.png', 8), file('toolu_2.full.jpeg', 6), file('toolu_3.full.jpg', 30), file('ql-out', 30, 'dir'), file('a b.full.png', 30), { name: 'toolu_4.full.png', kind: 'file', mtimeMs: 0 }], NOW)).toEqual(['toolu_1.full.png', 'toolu_3.full.jpg'])
+})
+
 test('a jump tries the folded run a call sits in, then the row, then the tool call beside it, and stops at the first that moves', async () => {
   const folds = new Map([
     ['toolu_read', 'group-3'],
@@ -810,7 +843,8 @@ test('a jump tries the folded run a call sits in, then the row, then the tool ca
 
 test('a turn is recorded, its picture kept, and once it ends a model writes the update the pane shows', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
-  const { files, ran, asked, forked } = engine(on, '1|You asked for the login flow to work end to end. Claude added the session cookie and it now does; every test passes.', '1|The login form after sign-in, opened to check the session cookie held.')
+  const { files, ran, asked, forked, made } = engine(on, '1|You asked for the login flow to work end to end. Claude added the session cookie and it now does; every test passes.', '1|The login form after sign-in, opened to check the session cookie held.')
+  made.add('/work/shots/login.png')
 
   await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
   await appended($.session.append(ask('row-ask', 'make the login flow work end to end')))
@@ -840,10 +874,10 @@ test('a turn is recorded, its picture kept, and once it ends a model writes the 
   await $.turn.complete({ answer: 'Login works.', durationMs: 5, isAborted: false, turnId: 't1', reason: 'answer' })
   await clock.advance(5000)
 
-  // The picture was converted to a PNG of the mod's own beside the trail's file, and copied whole to open.
+  // The picture was converted to a small PNG of the mod's own beside the trail's file. A file on disk is not copied whole.
   const kept = `${DIR}/shots/toolu_read.png`
   expect(ran).toContainEqual(['/usr/bin/sips', '-s', 'format', 'png', '-Z', '720', '/work/shots/login.png', '--out', kept])
-  expect(ran).toContainEqual(['/bin/cp', '/work/shots/login.png', `${DIR}/shots/toolu_read.full.png`])
+  expect(ran.some(([command]) => command === '/bin/cp')).toBe(false)
   expect(JSON.parse(files.get(`${DIR}/trail.json`) ?? '{}')).toMatchObject({ v: 5, sid: SID })
   // The model was put the turn as a log, once.
   expect(asked).toHaveLength(1)
@@ -877,9 +911,13 @@ test('a turn is recorded, its picture kept, and once it ends a model writes the 
   }
 
   const ui = await $.ui.mount(pane('terminal'))
-  // Opening a picture hands the whole of it to the person's viewer.
+  // Opening a picture hands the file itself to the person's viewer, while it is still the picture that was kept.
   await ui.press({ key: 'open:toolu_read:shot' })
-  expect(ran).toContainEqual(['/usr/bin/open', `${DIR}/shots/toolu_read.full.png`])
+  expect(ran.filter(([command]) => command === '/usr/bin/open')).toEqual([['/usr/bin/open', '/work/shots/login.png']])
+  // Gone, or written over since, it is the small copy the mod kept that opens.
+  made.delete('/work/shots/login.png')
+  await ui.press({ key: 'open:toolu_read:shot' })
+  expect(ran.filter(([command]) => command === '/usr/bin/open').at(-1)).toEqual(['/usr/bin/open', kept])
   // Every step is one key away.
   await ui.press({ key: 'tab:steps' })
   expect(await ui.find({ type: 'Text', text: '• The auth module is read. Now the session cookie.' })).toBeDefined()
@@ -962,6 +1000,70 @@ test('a thing Claude says is waiting on the person gets the tab for what waits, 
   expect(await ui.find({ type: 'Text', text: /^1 update · quiet since / })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'You asked where the branches stand. PR 7 is mergeable;' })).toBeDefined()
   await ui.unmount()
+})
+
+test('once a day a starting session clears what other sessions left that is past keeping, and never its own', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const { files, ran, listed, written } = engine(on)
+  const DAY = 86_400_000
+  const root = `${HOME}/.claude/trail`
+  const [recent, idle, old] = ['11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222', '33333333-3333-4333-8333-333333333333']
+  const folder = (name: string) => ({ name, kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false })
+  listed.set(root, [folder(SID), folder(recent), folder(idle), folder(old), { name: 'stray.txt', kind: 'file', size: 4, mtimeMs: NOW - 400 * DAY, isLink: false }])
+  written.set(`${root}/${recent}/trail.json`, NOW - DAY)
+  written.set(`${root}/${idle}/trail.json`, NOW - 9 * DAY)
+  written.set(`${root}/${old}/trail.json`, NOW - 40 * DAY)
+  for (const name of [recent, idle, old]) files.set(`${root}/${name}/shots`, '')
+  const picture = (name: string, days: number) => ({ name, kind: 'file' as const, size: 9000, mtimeMs: NOW - days * DAY, isLink: false })
+  listed.set(`${root}/${recent}/shots`, [picture('toolu_a.full.png', 8), picture('toolu_a.png', 8), picture('toolu_b.full.png', 2)])
+
+  await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+  await appended($.session.append(ask('row-ask', 'hello')))
+  await clock.advance(10_000)
+  const removed = () => ran.filter(([command, flag]) => command === '/bin/rm' && flag === '-rf')
+  // A session idle past the days a transcript is kept goes whole; one idle a week keeps its trail and loses its pictures.
+  expect(removed()).toEqual([
+    ['/bin/rm', '-rf', `${root}/${old}`],
+    ['/bin/rm', '-rf', `${root}/${idle}/shots`],
+  ])
+  // In a session that stays, only the whole-size copies made a week ago or more go.
+  expect(ran.filter(([command, flag]) => command === '/bin/rm' && flag === '-f' && String(ran).includes('.full.'))).toContainEqual(['/bin/rm', '-f', `${root}/${recent}/shots/toolu_a.full.png`])
+  expect(ran.flat().some(arg => arg.endsWith('toolu_a.png') || arg.endsWith('toolu_b.full.png'))).toBe(false)
+  // It is done once a day, whichever session comes to it: the module starting again does not do it again.
+  await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+  await clock.advance(10_000)
+  expect(removed()).toHaveLength(2)
+})
+
+test('/trail off stops every model call while the steps are still noted, and /trail on writes what was missed', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const { asked, forked } = engine(on, '1|You asked for the cache to be cleared. Claude cleared it and the build passes again.', '1|A picture.')
+  const typed = (args: string) => $.command.run({ command: 'trail', args, origin: PERSON, presentation: { isFullscreen: true, columns: 200 } })
+
+  await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+  expect((await typed('off')).text).toContain('Trail is off in every session')
+  await appended($.session.append(ask('row-ask', 'clear the cache and rebuild')))
+  await appended($.session.append(say('row-say', 'The cache is cleared.')))
+  await $.tool.call({ tool: 'Bash', tool_use_id: 'toolu_bash', command: 'make', description: 'Build it' })
+  await appended($.session.append(say('row-done', 'The build passes again.')))
+  await $.turn.complete({ answer: 'Done.', durationMs: 5, isAborted: false, turnId: 't1', reason: 'answer' })
+  await clock.advance(20_000)
+  // No model was asked for anything; the steps are there all the same, and the pane says why there are no updates.
+  expect([asked.length, forked.length]).toEqual([0, 0])
+  const ui = await $.ui.mount(pane('terminal'))
+  expect(await ui.find({ type: 'Text', text: /· updates are off: \/trail on$/ })).toBeDefined()
+  await ui.press({ key: 'tab:steps' })
+  expect(await ui.find({ type: 'Text', text: '❯ clear the cache and rebuild' })).toBeDefined()
+  await ui.press({ key: 'tab:feed' })
+  await ui.unmount()
+
+  expect((await typed('on')).text).toContain('Trail is on')
+  await clock.advance(5000)
+  expect(asked).toHaveLength(1)
+  const after = await $.ui.mount(pane('terminal'))
+  expect(await after.find({ type: 'Text', text: /^You asked for the cache to be cleared\./ })).toBeDefined()
+  expect(await after.find({ type: 'Text', text: /updates are off/ })).toBeUndefined()
+  await after.unmount()
 })
 
 test('Claude asks in the pane, under a picture; the answer pressed there goes back as the person’s next message', async ($, on) => {

@@ -36,8 +36,8 @@ export type Row =
       note: string
       /** How the words are weighted: what was asked, something to be read, or an aside. */
       tone: 'ask' | 'plain' | 'quiet'
-      /** An output's entry: the whole of it, for `[open]`. */
-      open?: string
+      /** An output's entry: the thing itself, for `[open]`. */
+      open?: Shot
       /** An output's entry: its picture, when it is one of those drawn. */
       picture?: Picture
       /** A thing the work left for the person to do: what `[done]` stops waiting. */
@@ -323,7 +323,7 @@ export const layout = (trail: Trail, look: Look): Page => {
           note: noteFor(item.id),
           // A request is the person's; work a finished background task set off, or that simply carried on, is nobody's.
           tone: item === untold ? 'quiet' : item.kind === 'ask' ? (NOBODYS.test(item.line) ? 'quiet' : 'ask') : item.kind === 'recap' || item.kind === 'compact' ? 'quiet' : 'plain',
-          ...(isOutput && item.shot ? { open: item.shot.full || item.shot.file } : {}),
+          ...(isOutput && item.shot && (item.shot.full || item.shot.file) ? { open: item.shot } : {}),
           ...(isDrawn ? { picture: pictureOf(item.shot!, room, item.line) } : {}),
         }
       },

@@ -1,5 +1,13 @@
 {
   "name": "claude-trail",
-  "owner": { "name": "Tyler Nishida" },
-  "plugins": [{ "name": "trail", "source": "./" }]
+  "description": "Trail: a side pane for Claude Code that tells a long conversation as an activity feed and puts what is waiting on you first.",
+  "owner": {
+    "name": "Tyler Nishida"
+  },
+  "plugins": [
+    {
+      "name": "trail",
+      "source": "./"
+    }
+  ]
 }

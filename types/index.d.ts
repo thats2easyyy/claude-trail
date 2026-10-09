@@ -24,11 +24,14 @@ export type OutputType = 'image' | 'video' | 'file' | 'link'
  * Something the work produced or looked at, kept for the trail: a small PNG
  * of the mod's own to draw in the pane (a video's or a document's is its
  * preview; `file` is empty where there is none), its shape, and the whole
- * thing to open: a file's path, or a page's address. `note` is its caption,
+ * thing to open: a file's path, or a page's address. A picture that is a
+ * file on disk is not copied: `full` is the file itself and `stamp` when it
+ * was last written as the picture was kept, so it is opened only while it
+ * is still that picture, and the small PNG otherwise. `note` is its caption,
  * what it shows and what it was about: absent until the conversation has been
  * asked, empty when it had nothing to say.
  */
-export type Shot = { file: string; w: number; h: number; full?: string; note?: string; type?: OutputType; from?: Source }
+export type Shot = { file: string; w: number; h: number; full?: string; stamp?: number; note?: string; type?: OutputType; from?: Source }
 
 /**
  * Where a picture came from when it is not Claude's own work: the `person`

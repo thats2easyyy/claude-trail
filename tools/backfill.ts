@@ -131,12 +131,17 @@ if (file) {
     // A picture Claude sent is a file somewhere on disk: the copy the mod made when it was sent, else the file itself.
     const path = sent.get(event.id)
     if (!existsSync(thumb) && path !== undefined && path.startsWith('/') && existsSync(path)) thumbOf(path, thumb)
-    // The picture as the transcript holds it is kept whole beside its small copy, to open.
+    // The file the picture was, when it is still on disk as it was when Claude opened or sent it: written no
+    // later than that. It is then opened where it lies, and no copy of it is kept.
+    const lies = path ?? opened.get(event.id)
+    const written = lies !== undefined && lies.startsWith('/') && existsSync(lies) && statSync(lies).isFile() ? statSync(lies).mtimeMs : 0
+    const isAsItWas = written > 0 && event.at > 0 && written <= event.at + 2000
+    // Otherwise the picture as the transcript holds it is kept whole beside its small copy, to open.
     const whole = join(shots, `${name}.full${SUFFIX[held?.mediaType ?? ''] ?? '.png'}`)
     if (!existsSync(thumb) && held && wanted.has(event.id)) {
       try {
         writeFileSync(whole, Buffer.from(held.base64, 'base64'))
-        if (!thumbOf(whole, thumb)) rmSync(whole, { force: true })
+        if (!thumbOf(whole, thumb) || isAsItWas) rmSync(whole, { force: true })
       } catch {
         // A picture that will not convert is left out; the line it would have had is no loss beside the rest.
         rmSync(whole, { force: true })
@@ -153,7 +158,7 @@ if (file) {
     // A picture Claude opened that was on disk before the session began was looked at, not made.
     const source = opened.get(event.id)
     const from = source !== undefined && existsSync(source) && isEarlier(statSync(source).mtimeMs, began) ? { from: 'earlier' as const } : {}
-    trail = add(trail, { ...event, ...from, file: thumb, ...sizeOf(thumb), ...(full ? { full: join(shots, full) } : path !== undefined && existsSync(path) ? { full: path } : {}) })
+    trail = add(trail, { ...event, ...from, file: thumb, ...sizeOf(thumb), ...(full ? { full: join(shots, full) } : isAsItWas && lies ? { full: lies, stamp: Math.round(written) } : {}) })
   }
   mkdirSync(out, { recursive: true })
   writeFileSync(join(out, 'trail.json'), JSON.stringify({ v: 5, sid, trail }))

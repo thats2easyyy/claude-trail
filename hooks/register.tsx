@@ -5,6 +5,8 @@ import type { Beat, Mode, OutputType, Picked, Question, Saved, Shot, Source, Tra
 import { adopt, feedIn, nextJob, parseBeats, parseCleared, SYSTEM } from './digest.ts'
 import { captionJob, parseCaptions } from './caption.ts'
 import { candidates, reach } from './jump.ts'
+import { isSession, keepDays, prunable, sized, staleCopies } from './prune.ts'
+import type { Kept } from './prune.ts'
 import { add, basename, clean, emptyTrail, isEarlier, mended, outputType, paneAnswer, publishedAt, SENT, tag, toolNote, videosNamed, waitingCount } from './trail.ts'
 import type { TrailEvent } from './trail.ts'
 import { clock, layout, zoneOf } from './view.ts'
@@ -42,12 +44,19 @@ const THUMB_PX = '720'
 const SIPS = '/usr/bin/sips'
 const BASE64 = '/usr/bin/base64'
 const RM = '/bin/rm'
+const DU = '/usr/bin/du'
+/** How often, across every session on the machine, what is past keeping is looked for; and how long after a session starts. */
+const PRUNE_EVERY_MS = 86_400_000
+const PRUNE_AFTER_MS = 8000
+const COPIES_AT_ONCE = 40
 const CP = '/bin/cp'
 const OPEN = '/usr/bin/open'
 const QLMANAGE = '/usr/bin/qlmanage'
 const DATE = '/bin/date'
 const REBUILD_MS = 120_000
-const USAGE = 'Usage: /trail [close|rebuild|where]'
+const USAGE = 'Usage: /trail [close|off|on|rebuild|where]'
+/** What the line under the tabs says while the person has the model calls turned off. */
+const OFF = 'updates are off: /trail on'
 const OPENED = 'Trail opened. Point at an entry and click the arrow beside its time to jump to it in the conversation.'
 /**
  * The way to an entry's place in the conversation: an arrow beside its time,
@@ -149,6 +158,7 @@ const diag = {
   digests: [] as string[],
   captions: [] as string[],
   questions: [] as string[],
+  prunes: [] as string[],
   faults: [] as string[],
 }
 
@@ -202,6 +212,17 @@ const tell = async ($: Dollar, text: string) => {
 }
 
 /**
+ * Whether the person has turned the mod's model calls off (`/trail off`), on
+ * this machine and in every session: the steps are still noted, which costs
+ * nothing, but no update is written and no picture captioned until `/trail on`.
+ */
+const isOff = ($: Dollar): Promise<boolean> =>
+  $.store.get('off').then(
+    value => value === true,
+    () => false,
+  )
+
+/**
  * Puts a stretch of steps to a model and resolves its reply, or null when no
  * model gave one. The first model to answer is the one asked from then on.
  */
@@ -232,6 +253,10 @@ const complete = async ($: Dollar, prompt: string): Promise<string | null> => {
  */
 const digest = async ($: Dollar): Promise<number | null> => {
   if (isDigesting || isRebuilding || !sid) return null
+  if (await isOff($)) {
+    await tell($, OFF)
+    return null
+  }
   const job = nextJob(live, skipped)
   if (!job) {
     await tell($, '')
@@ -288,7 +313,7 @@ const digestSoon = ($: Dollar, ms: number) => {
  * provider still has that transcript at hand, and for all the pictures at once.
  */
 const caption = async ($: Dollar) => {
-  if (isCaptioning || isRebuilding || !sid) return
+  if (isCaptioning || isRebuilding || !sid || (await isOff($))) return
   const job = captionJob(live, at => clock(at, zone))
   if (!job) return
   const of = sid
@@ -370,6 +395,64 @@ const rebuild = async ($: Dollar, isAsked = false): Promise<string> => {
   return why
 }
 
+/**
+ * Removes what the mod kept for other sessions that is past keeping: the
+ * pictures of one idle a week, the whole folder of one idle as long as Claude
+ * Code keeps a transcript, and in those that stay the whole-size copies made
+ * a week ago or more. Once a day at most, whichever session comes to it
+ * first, and never this session's own. Only folders the mod made, named by a
+ * session's id inside the mod's own folder, are ever removed.
+ */
+const prune = async ($: Dollar) => {
+  try {
+    const root = dir.slice(0, dir.lastIndexOf('/'))
+    if (!sid || !root.startsWith('/') || !root.endsWith('/.claude/trail')) return
+    const now = await $.clock.now()
+    const last = await $.store.get('prunedAt')
+    if (typeof last === 'number' && now - last < PRUNE_EVERY_MS) return
+    await $.store.set('prunedAt', now)
+    const kept: Kept[] = []
+    for (const entry of await $.fs.list(root)) {
+      if (entry.kind !== 'dir') continue
+      const at = `${root}/${entry.name}`
+      const written = (path: string) =>
+        $.fs.stat(path).then(
+          stat => stat.mtimeMs,
+          () => 0,
+        )
+      kept.push({ name: entry.name, touchedAt: (await written(`${at}/trail.json`)) || (await written(at)), hasShots: await $.fs.exists(`${at}/shots`).catch(() => false) })
+    }
+    const settings = (await $.settings.read().catch(() => ({}))) as Record<string, unknown>
+    const { folders, pictures } = prunable(kept, now, sid, keepDays(settings['cleanupPeriodDays']))
+    for (const name of folders) await $.process.run([RM, '-rf', `${root}/${name}`], { timeoutMs: 60_000 })
+    for (const name of pictures) await $.process.run([RM, '-rf', `${root}/${name}/shots`], { timeoutMs: 60_000 })
+    // In the sessions that stay, this one included, a whole-size copy goes a week after it was made.
+    let copies = 0
+    for (const one of kept) {
+      if (!isSession(one.name) || !one.hasShots || folders.includes(one.name) || pictures.includes(one.name)) continue
+      const shots = `${root}/${one.name}/shots`
+      const stale = staleCopies(await $.fs.list(shots).catch(() => []), now)
+      for (let from = 0; from < stale.length; from += COPIES_AT_ONCE) await $.process.run([RM, '-f', ...stale.slice(from, from + COPIES_AT_ONCE).map(name => `${shots}/${name}`)], { timeoutMs: 60_000 })
+      copies += stale.length
+    }
+    jot(diag.prunes, `${kept.length} sessions kept: removed ${folders.length} whole, the pictures of ${pictures.length}, ${copies} whole-size copies`)
+  } catch (error) {
+    fault($, 'prune', error)
+  }
+}
+
+/** How much the mod keeps on disk, for `/trail where`: this session's folder and all of them together. */
+const keptSize = async ($: Dollar): Promise<string> => {
+  try {
+    const root = dir.slice(0, dir.lastIndexOf('/'))
+    const ran = await $.process.run([DU, '-sk', dir, root], { timeoutMs: 20_000 })
+    const [own, all] = ran.stdout.split('\n').map(line => Number(line.trim().split(/\s+/)[0]))
+    return own !== undefined && all !== undefined && Number.isFinite(own) && Number.isFinite(all) ? ` (${sized(own)}; every conversation together ${sized(all)})` : ''
+  } catch {
+    return ''
+  }
+}
+
 const zoneNow = async ($: Dollar): Promise<number> => {
   try {
     const ran = await $.process.run([DATE, '+%z'], { timeoutMs: 5000 })
@@ -399,6 +482,7 @@ const begin = async ($: Dollar) => {
     if (!live.isOpen) captionSoon($)
     // Told before the mod looked for what waits on the person: its latest is read once more, for that.
     if (!live.sought) $.clock.after(50, () => void rebuild($, true))
+    $.clock.after(PRUNE_AFTER_MS, () => void prune($))
     return
   }
   live = (await load($)) ?? emptyTrail()
@@ -407,6 +491,7 @@ const begin = async ($: Dollar) => {
   await update($, page, () => 0)
   await push($, false)
   // The file may be from before the session went on without the mod; its transcript has all of it.
+  $.clock.after(PRUNE_AFTER_MS, () => void prune($))
   const isBehind = !live.sought
   $.clock.after(50, () => void rebuild($, isBehind).then(why => (why ? $.ui.log(`trail: could not read this session's transcript back (${why}); /trail rebuild tries again`) : undefined)))
 }
@@ -447,11 +532,15 @@ const sizeOf = async ($: Dollar, path: string): Promise<{ w: number; h: number }
 
 /**
  * Keeps a picture for the trail: a small PNG of the mod's own to draw in the
- * pane, and a copy of the whole picture to open, both safe from whatever
- * later overwrites the original. Host commands make them, since a mod writes
- * only text. Resolves null for a picture that could not be read.
+ * pane, safe from whatever later overwrites the original. The whole picture
+ * is not copied when it is a file on disk (copies were most of what the mod
+ * kept): the file is opened where it lies, for as long as it is still the
+ * picture that was kept. One that is passing (bytes that never were a file)
+ * is copied whole, there being nowhere else to open it from. Host commands
+ * make these, since a mod writes only text. Resolves null for a picture that
+ * could not be read.
  */
-const keep = async ($: Dollar, id: string, source: string, suffix: string): Promise<Shot | null> => {
+const keep = async ($: Dollar, id: string, source: string, suffix: string, isPassing = false): Promise<Shot | null> => {
   await ready($)
   if (!source.startsWith('/')) return null
   if (!hasShotsDir) {
@@ -466,11 +555,15 @@ const keep = async ($: Dollar, id: string, source: string, suffix: string): Prom
     jot(diag.shots, `${id} not kept: ${(ran.stderr || ran.stdout).trim().slice(0, 120)}`)
     return null
   }
-  const full = `${dir}/shots/${name}.full${suffix}`
-  const copied = await $.process.run([CP, source, full], { timeoutMs: 15_000 })
   const { w, h } = await sizeOf($, out)
   jot(diag.shots, `${id} ${w}x${h}`)
-  return copied.exitCode === 0 ? { file: out, w, h, full } : { file: out, w, h }
+  if (isPassing) {
+    const full = `${dir}/shots/${name}.full${suffix}`
+    const copied = await $.process.run([CP, source, full], { timeoutMs: 15_000 })
+    return copied.exitCode === 0 ? { file: out, w, h, full } : { file: out, w, h }
+  }
+  const lies = await $.fs.stat(source).catch(() => null)
+  return lies?.kind === 'file' ? { file: out, w, h, full: source, stamp: Math.round(lies.mtimeMs) } : { file: out, w, h }
 }
 
 /**
@@ -531,10 +624,10 @@ const heedVideos = async ($: Dollar, id: string, text: string, since: number) =>
 const suffixOf = (path: string) => (/\.(png|jpe?g|gif|webp)$/i.exec(path)?.[0] ?? '.png').toLowerCase()
 
 /** A picture the model looked at or sent: kept, and set in the trail where it happened. Resolves whether it was. */
-const shoot = async ($: Dollar, id: string, source: string, label: string, anchor: string, suffix: string, from?: Source, note?: string): Promise<boolean> => {
+const shoot = async ($: Dollar, id: string, source: string, label: string, anchor: string, suffix: string, from?: Source, note?: string, isPassing = false): Promise<boolean> => {
   try {
-    const shot = await keep($, id, source, suffix)
-    if (shot) await record($, now => ({ t: 'shot', id, at: now, anchor, file: shot.file, w: shot.w, h: shot.h, label, ...(shot.full ? { full: shot.full } : {}), ...(from ? { from } : {}), ...(note ? { note } : {}) }))
+    const shot = await keep($, id, source, suffix, isPassing)
+    if (shot) await record($, now => ({ t: 'shot', id, at: now, anchor, file: shot.file, w: shot.w, h: shot.h, label, ...(shot.full ? { full: shot.full } : {}), ...(shot.stamp !== undefined ? { stamp: shot.stamp } : {}), ...(from ? { from } : {}), ...(note ? { note } : {}) }))
     return shot !== null
   } catch (error) {
     fault($, 'shoot', error)
@@ -551,7 +644,7 @@ const shootInline = async ($: Dollar, id: string, held: Held, label: string, anc
     await $.fs.write(text, held.data)
     hasShotsDir = true
     const ran = await $.process.run([BASE64, '-D', '-i', text, '-o', bytes], { timeoutMs: 15_000 })
-    if (ran.exitCode === 0) await shoot($, id, bytes, label, anchor, suffixOf(`.${held.type.split('/')[1] ?? 'png'}`), from)
+    if (ran.exitCode === 0) await shoot($, id, bytes, label, anchor, suffixOf(`.${held.type.split('/')[1] ?? 'png'}`), from, undefined, true)
     await $.process.run([RM, '-f', text, bytes], { timeoutMs: 5000 })
   } catch (error) {
     fault($, 'shootInline', error)
@@ -767,11 +860,29 @@ const unfold = async ($: Dollar, target: Target) => {
   }
 }
 
-/** Opens a kept picture, whole, in the person's own viewer. */
-const openPicture = async ($: Dollar, path: string) => {
+/**
+ * Opens an output in the person's own viewer: the thing itself where it
+ * lies, or the small copy the mod kept when a picture's file is gone or has
+ * been written over since (the same name now holds another picture).
+ */
+const openPicture = async ($: Dollar, shot: Shot) => {
   try {
+    let path = shot.full || shot.file
+    if (shot.full && shot.type !== 'link') {
+      const lies = await $.fs.stat(shot.full).catch(() => null)
+      const isSame = lies?.kind === 'file' && (shot.stamp === undefined || Math.round(lies.mtimeMs) === shot.stamp)
+      // A video or a document has no copy to fall back on: what is there now is opened, if anything is.
+      if (!isSame && shot.file) {
+        path = shot.file
+        $.ui.toast(lies ? 'The file has changed since: opening the copy Trail kept.' : 'The file is gone: opening the copy Trail kept.')
+      } else if (!lies) {
+        $.ui.toast(`Trail could not open it: ${basename(shot.full)} is no longer there.`)
+        return
+      }
+    }
+    if (!path) return
     const ran = await $.process.run([OPEN, path], { timeoutMs: 10_000 })
-    if (ran.exitCode !== 0) $.ui.toast(`Trail could not open the picture: ${ran.stderr.trim().slice(0, 80)}`)
+    if (ran.exitCode !== 0) $.ui.toast(`Trail could not open it: ${ran.stderr.trim().slice(0, 80)}`)
   } catch (error) {
     fault($, 'openPicture', error)
   }
@@ -823,7 +934,7 @@ export const register: Register = on => {
     await $.command.register({
       name: 'trail',
       description: 'Show what this conversation did as a feed in a side pane; click a line to jump there',
-      argumentHint: '[close|rebuild|where]',
+      argumentHint: '[close|off|on|rebuild|where]',
       immediate: true,
     })
     await $.tool.register({ name: 'ask', description: ASK_DESCRIPTION, inputSchema: ASK_SCHEMA })
@@ -848,7 +959,19 @@ export const register: Register = on => {
       await $.ui.close({ id: PANE })
       return { text: 'Trail closed.' }
     }
-    if (verb === 'where') return { text: `Trail keeps this session in ${dir}` }
+    if (verb === 'where') return { text: `Trail keeps this session in ${dir}${await keptSize($)}` }
+    if (verb === 'off') {
+      await $.store.set('off', true)
+      await tell($, OFF)
+      return { text: 'Trail is off in every session: it still notes each step, which costs nothing, but writes no updates and asks no model. /trail on turns it back on.' }
+    }
+    if (verb === 'on') {
+      await $.store.set('off', false)
+      await tell($, '')
+      digestSoon($, 50)
+      if (!live.isOpen) captionSoon($)
+      return { text: 'Trail is on: updates are being written for what happened meanwhile.' }
+    }
     if (verb === 'rebuild') {
       const why = await rebuild($, true)
       if (why) return { text: `Trail could not read the transcript back: ${why}` }
@@ -1014,7 +1137,7 @@ export const register: Register = on => {
             }
             if (row.kind === 'question') {
               const { question, picture } = row
-              const whole = question.shot?.full || question.shot?.file
+              const whole = question.shot && (question.shot.full || question.shot.file) ? question.shot : undefined
               return (
                 <Box key={`row:${row.key}`} flexDirection="column" rowGap={1}>
                   <Text dimColor wrap="truncate-end">{`Claude is asking you · ${row.time}`}</Text>

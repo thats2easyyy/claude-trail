@@ -8,7 +8,7 @@ export type TrailEvent =
   | { t: 'say'; id: string; at: number; text: string }
   | { t: 'tool'; id: string; at: number; tool: string; note: string; file?: string }
   | { t: 'fail'; id: string; at: number }
-  | { t: 'shot'; id: string; at: number; anchor: string; file: string; w: number; h: number; label: string; full?: string; type?: OutputType; from?: Source; note?: string }
+  | { t: 'shot'; id: string; at: number; anchor: string; file: string; w: number; h: number; label: string; full?: string; stamp?: number; type?: OutputType; from?: Source; note?: string }
   | { t: 'recap'; id: string; at: number; text: string }
   | { t: 'compact'; id: string; at: number }
   | { t: 'question'; id: string; at: number; text: string; options: string[]; shot?: Shot }
@@ -422,6 +422,7 @@ const fold = (trail: Trail, event: TrailEvent): Trail => {
         shot: { file: event.file, w: event.w, h: event.h },
       }
       if (event.full) shot.shot!.full = event.full
+      if (event.stamp !== undefined) shot.shot!.stamp = event.stamp
       if (event.type && event.type !== 'image') shot.shot!.type = event.type
       if (event.from) shot.shot!.from = event.from
       // What Claude said of a file as it handed it over is its caption from the start.
