@@ -1,0 +1,5 @@
+{
+  "name": "claude-trail",
+  "owner": { "name": "Tyler Nishida" },
+  "plugins": [{ "name": "trail", "source": "./" }]
+}
