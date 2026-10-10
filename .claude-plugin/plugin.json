@@ -1,7 +1,7 @@
 {
   "name": "trail",
-  "version": "0.4.0",
-  "description": "A side pane that tells you what happened in a long conversation: what is waiting on you, short updates as the work goes, the files Claude sent you, big tasks done, and a jump to any point. /trail",
+  "version": "0.5.0",
+  "description": "A side pane that tells you what happened in a long conversation: what was done in a few words, what is waiting on you with the command or link to act on it, what Claude made, and what you asked. Uses no tokens while closed. /trail",
   "author": {
     "name": "Tyler Nishida"
   },

@@ -3,13 +3,13 @@ import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import { captionJob, parseCaptions } from '../hooks/caption.ts'
-import { adopt, feedIn, nextJob, parseBeats, parseCleared } from '../hooks/digest.ts'
+import { adopt, feedIn, nextJob, parseBeats, parseCleared, parsePictures, repoPage, withPullLinks } from '../hooks/digest.ts'
 import { candidates, reach } from '../hooks/jump.ts'
 import { keepDays, prunable, sized, staleCopies } from '../hooks/prune.ts'
 import { eventsFromRows } from '../hooks/rows.ts'
 import { add, ANSWERED_THERE, emptyTrail, firstSentence, MAX_ITEMS, mended, outputType, paneAnswer, promptLine, publishedAt, tag, videosNamed, waitsOf, workLine } from '../hooks/trail.ts'
 import type { TrailEvent } from '../hooks/trail.ts'
-import { layout, pictureBox, wrap, zoneOf } from '../hooks/view.ts'
+import { layout, wrap, zoneOf } from '../hooks/view.ts'
 
 const SID = 'session-1'
 const HOME = '/Users/someone'
@@ -71,7 +71,9 @@ function engine(on: On, reply = '', captions = '') {
   on('session.model', () => ({ value: 'opus' }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
   on('tool.register', (_$, e) => ({ value: { tool: `mcp__trail__${e.name}` } }))
-  on('ui.panes', () => ({ value: [] }))
+  /** Whether the pane is on screen: the conversation is asked about its pictures only while it is. */
+  const showing = { pane: false }
+  on('ui.panes', () => ({ value: showing.pane ? [{ id: 'trail', title: 'Trail', isShown: true, isFocused: false }] : [] }) as never)
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('ui.log', () => ({ value: undefined }))
   on('ui.toast', () => ({ value: undefined }))
@@ -118,7 +120,7 @@ function engine(on: On, reply = '', captions = '') {
     return { result: { stdout: '', stderr: '', interrupted: false }, text: '' }
   })
 
-  return { files, ran, sent, asked, forked, made, listed, written }
+  return { files, ran, sent, asked, forked, made, listed, written, showing }
 }
 
 /** A row as the engine appends it: what the model said, what the person asked, or a command they typed. */
@@ -374,7 +376,7 @@ test('work is put to a model as a log divided into stretches, and its reply beco
       '[1]',
       '(before saying anything) [did: 1 read]',
       'said: The encounter script is read. Next the attack patterns. [did: Run the play-mode tests; 1 failed · 1 command · edited boss.cs]',
-      'looked at a picture: phase2.png',
+      '[p1] looked at a picture: phase2.png',
       'final answer: The boss fight is playable end to end. Two tests are still flaky.',
     ].join('\n'),
   )
@@ -383,7 +385,7 @@ test('work is put to a model as a log divided into stretches, and its reply beco
 
   const reply = [
     'Here is the feed:',
-    '1|You asked for a playable boss fight. Claude added the attack patterns and it now plays end to end; two tests are still flaky.',
+    '1|Added the boss attack patterns ; Fight plays end to end, two tests flaky. ; ; A third thing done ; A fourth is one too many',
     '1|A second line for the same stretch is one too many.',
     '7|There is no seventh stretch.',
     'done|1|Boss fight playable from start to finish.',
@@ -392,25 +394,49 @@ test('work is put to a model as a log divided into stretches, and its reply beco
   ].join('\n')
   const beats = parseBeats(reply, job!)
   expect(beats.map(beat => [beat.ref, beat.kind, beat.title])).toEqual([
-    ['s2', 'summary', 'You asked for a playable boss fight. Claude added the attack patterns and it now plays end to end; two tests are still flaky.'],
-    // A big task finished is its own line, for the list of things done.
-    ['s2', 'built', 'Boss fight playable from start to finish'],
+    // An update is the stretch's actions, three at most, each a few words on a line of its own.
+    ['s2', 'summary', 'Added the boss attack patterns\nFight plays end to end, two tests flaky\nA third thing done'],
   ])
   expect(beats[0]).toMatchObject({ id: 'b:s2', anchor: 's2', at: 7000, turn: 1 })
-  expect(beats[1]).toMatchObject({ id: 'd:s2:0', anchor: 's2', at: 7000 })
 
   const told = feedIn(trail, job!, beats)
-  expect(told.feed).toHaveLength(2)
-  // The feed keeps to the updates; the things done are a list of their own.
-  const lines = (mode: 'feed' | 'done') => layout(told, { width: 58, picked: NOBODY, page: 0, mode, zone: 0 }).rows.flatMap(found => (found.kind === 'line' ? [[found.key, found.glyph, found.lines[0]]] : []))
-  expect(lines('feed').map(([key]) => key)).toEqual(['b:s2', 't4:shot'])
-  expect(lines('done')).toEqual([['d:s2:0', '✓', 'Boss fight playable from start to finish']])
-  const task = layout(told, { width: 58, picked: NOBODY, page: 0, mode: 'done', zone: 0 }).rows.find(found => found.kind === 'line')
-  expect(task?.kind === 'line' && [task.time, task.pad, task.hasMore]).toEqual(['00:00', 2, false])
-  expect(layout(told, { width: 58, picked: NOBODY, page: 0, mode: 'done', zone: 0 }).foot).toBe('1 big task done · quiet since Thu Jan 1 00:00')
+  // A line the model was not asked for (older versions listed big tasks done) is no update.
+  expect(told.feed).toHaveLength(1)
+  // The feed is the updates and nothing else: each action a short line with its mark. What the work produced has the view of outputs.
+  expect(layout(told, { width: 58, picked: NOBODY, page: 0, mode: 'feed', zone: 0 }).rows.flatMap(found => (found.kind === 'line' ? [[found.key, found.lines]] : []))).toEqual([['b:s2', ['• Added the boss attack patterns', '• Fight plays end to end, two tests flaky', '• A third thing done']]])
+  // An update from before updates were actions, a paragraph, is still read across the pane as it was written.
+  const prose = 'You asked for a playable boss fight. Claude added the attack patterns and it now plays end to end; two tests are still flaky.'
+  const old = layout({ ...told, feed: told.feed.map(beat => ({ ...beat, title: prose })) }, { width: 58, picked: NOBODY, page: 0, mode: 'feed', zone: 0 }).rows.find(found => found.kind === 'line')
+  expect(old?.kind === 'line' && old.lines.join(' ')).toBe(prose)
   expect(told.items.every(item => item.fed === true && item.more === undefined)).toBe(true)
   // Told once, it is not put to a model again.
   expect(nextJob(told)).toBeNull()
+})
+
+test('a picture gets a caption from the words around it for next to nothing, and the conversation that saw it can still better it', () => {
+  const trail = folded(WORKED)
+  const job = nextJob(trail)!
+  expect(job.pics).toEqual(['t4:shot'])
+  const reply = '1|The boss fight was made playable.\npic|p1|The second phase of the boss fight, opened to check the new attack patterns.\npic|p2|There is no second picture\npic|p1|Said twice'
+  // What is said of a picture is no update: it is the picture's caption, marked as made out from the log and not from the picture.
+  expect(parseBeats(reply, job).map(beat => beat.id)).toEqual(['b:s2'])
+  expect(parsePictures(reply, job)).toEqual([{ id: 't4:shot', text: 'The second phase of the boss fight, opened to check the new attack patterns.' }])
+  // A log that says nothing of a picture leaves it without one, never a guess at what is in it.
+  expect(parsePictures('1|Done.\npic|p1|\npic|p1|—', job)).toEqual([])
+  const told = feedIn(trail, job, parseBeats(reply, job), [], parsePictures(reply, job))
+  const shot = () => told.items.find(item => item.id === 't4:shot')?.shot
+  expect([shot()?.note, shot()?.guess]).toEqual(['The second phase of the boss fight, opened to check the new attack patterns.', true])
+  // Such a caption is still one the conversation may be asked to better; its own answer replaces it and is final.
+  const again = captionJob(told, () => '00:00')
+  expect(again?.shots.map(item => item.id)).toEqual(['t4:shot'])
+  const seen = add(told, { t: 'caption', id: 't4:shot', at: 9500, text: 'Phase two with the boss at half health and the new sweep attack mid-swing.' })
+  expect([seen.items.find(item => item.id === 't4:shot')?.shot?.note, seen.items.find(item => item.id === 't4:shot')?.shot?.guess]).toEqual(['Phase two with the boss at half health and the new sweep attack mid-swing.', undefined])
+  expect(captionJob(seen, () => '00:00')).toBeNull()
+  // A conversation that cannot find the picture leaves the caption it had, and is not asked again.
+  const lost = add(told, { t: 'caption', id: 't4:shot', at: 9500, text: '' })
+  expect([lost.items.find(item => item.id === 't4:shot')?.shot?.note?.startsWith('The second phase'), lost.items.find(item => item.id === 't4:shot')?.shot?.guess, captionJob(lost, () => '00:00')]).toEqual([true, undefined, null])
+  // Read back from its transcript, a trail keeps the caption and that it was only made out from the log.
+  expect(adopt(folded(WORKED), told).items.find(item => item.id === 't4:shot')?.shot).toMatchObject({ note: shot()?.note, guess: true })
 })
 
 test('a question with no work in it needs no model, and a long run is told of a stretch at a time as it goes', () => {
@@ -475,21 +501,16 @@ test('what the work leaves waiting on the person is listed apart, until a later 
   const reply = ['1|PR 7 passed CI and is mergeable; the packaging branch is held up.', `wait|1|${RUN}`, 'wait|9|There is no ninth stretch', 'clear|w1'].join('\n')
   const beats = parseBeats(reply, job)
   expect(beats.map(beat => [beat.id, beat.kind, beat.title, beat.anchor])).toEqual([
-    ['b:s1', 'summary', 'PR 7 passed CI and is mergeable; the packaging branch is held up.', 's1'],
+    ['b:s1', 'summary', 'PR 7 passed CI and is mergeable; the packaging branch is held up', 's1'],
     ['w:s1:0', 'waiting', RUN, 's1'],
   ])
   // Nothing was named as still waiting, so there is nothing to clear.
   expect(parseCleared(reply, job)).toEqual([])
   let told = feedIn(trail, job, beats)
   const look = { width: 58, picked: NOBODY, page: 0, zone: 0 }
-  const lines = (from: typeof told, mode: 'feed' | 'done' | 'questions') => layout(from, { ...look, mode }).rows.flatMap(found => (found.kind === 'line' ? [[found.key, found.glyph, found.tone, found.settles]] : []))
-  // It is no update and no task done. It heads the feed, set apart above the latest of it, and has the view of what waits; in both, the way to say it is done.
-  expect(layout(told, { ...look, mode: 'feed' }).rows.map(found => (found.kind === 'head' ? found.text : found.kind === 'line' ? found.key : found.kind))).toEqual(['Waiting on you', 'w:s1:0', 'day', 'b:s1'])
-  expect(lines(told, 'feed')).toEqual([
-    ['w:s1:0', '○', 'ask', 'w:s1:0'],
-    ['b:s1', ' ', 'plain', undefined],
-  ])
-  expect(lines(told, 'done')).toEqual([])
+  const lines = (from: typeof told, mode: 'feed' | 'questions') => layout(from, { ...look, mode }).rows.flatMap(found => (found.kind === 'line' ? [[found.key, found.glyph, found.tone, found.settles]] : []))
+  // It is no update, and no part of the feed: it has the view of what waits, with the way to say it is done.
+  expect(lines(told, 'feed')).toEqual([['b:s1', ' ', 'plain', undefined]])
   expect(lines(told, 'questions')).toEqual([['w:s1:0', '○', 'ask', 'w:s1:0']])
   expect(layout(told, { ...look, mode: 'feed' }).foot).toBe('1 update · 1 waiting on you · quiet since Thu Jan 1 00:00')
 
@@ -522,7 +543,6 @@ test('what the work leaves waiting on the person is listed apart, until a later 
   expect(after.feed.find(beat => beat.id === 'w:s1:0')?.over).toBe(8000)
   expect(waitsOf(after)).toEqual([])
   expect(layout(after, { ...look, mode: 'questions' }).rows).toEqual([])
-  expect(layout(after, { ...look, mode: 'feed' }).rows.some(found => found.kind === 'head')).toBe(false)
   expect(layout(after, { ...look, mode: 'feed' }).foot).toBe('3 updates · quiet since Thu Jan 1 00:00')
 
   // A log of history, with something already told after it, leaves nothing waiting: that was dealt with long since.
@@ -538,6 +558,43 @@ test('what the work leaves waiting on the person is listed apart, until a later 
   const old = nextJob(caughtUp)!
   expect([old.ids, old.isLatest]).toEqual([['p1', 's1'], false])
   expect(waitsOf(feedIn(caughtUp, old, parseBeats('1|Claude asked which of the two you wanted.\nwait|1|Say which of the two you want', old)))).toEqual([])
+})
+
+test('a thing waiting carries what it is done with: the command to copy, the link to open, and a pull request named by number gets its link', () => {
+  const trail = folded([
+    { t: 'prompt', id: 'p1', at: 1000, text: 'where do the two pull requests stand?' },
+    // What Claude said has a command in a code block and a link behind a name: both are kept for the model, which the line shown has no room for.
+    { t: 'say', id: 's1', at: 2000, text: 'Both are ready. Merge one first:\n\n```bash\ngh pr merge 13 --squash\n```\n\nThe other is [PR 14](https://github.com/acme/app/pull/14), which conflicts with it. Which one?' },
+    { t: 'end', at: 3000 },
+  ])
+  const said = trail.items.find(item => item.id === 's1')
+  expect(said?.line).not.toContain('gh pr merge')
+  expect(said?.line).not.toContain('https://')
+  expect(said?.more).toBe('Both are ready. Merge one first: `gh pr merge 13 --squash` The other is PR 14 (https://github.com/acme/app/pull/14), which conflicts with it. Which one?')
+  const job = nextJob(trail)!
+  expect(job.prompt).toContain('`gh pr merge 13 --squash`')
+  expect(job.prompt).toContain('https://github.com/acme/app/pull/14')
+
+  const reply = ['1|Readied PRs 13 and 14', 'wait|1|Merge PR 13 or 14 first and say which ::: `gh pr merge 13 --squash` ;; https://github.com/acme/app/pull/14 ;; ;; x', 'wait|1|Sign in to the registry'].join('\n')
+  const beats = parseBeats(reply, job)
+  expect(beats.filter(beat => beat.kind === 'waiting').map(beat => [beat.title, beat.refs])).toEqual([
+    ['Merge PR 13 or 14 first and say which', ['gh pr merge 13 --squash', 'https://github.com/acme/app/pull/14']],
+    // One with nothing to run or open has nothing under it.
+    ['Sign in to the registry', undefined],
+  ])
+  // A pull request the wait names by number gets its link from the session's own repository; one already there is not added twice.
+  expect(repoPage('git@github.com:acme/app.git')).toBe('https://github.com/acme/app')
+  expect(repoPage('https://github.com/acme/app.git')).toBe('https://github.com/acme/app')
+  expect([repoPage('https://gitlab.com/acme/app.git'), repoPage(null), repoPage('')]).toEqual(['', '', ''])
+  const linked = withPullLinks(beats, 'git@github.com:acme/app.git')
+  expect(linked.filter(beat => beat.kind === 'waiting').map(beat => beat.refs)).toEqual([['https://github.com/acme/app/pull/13', 'gh pr merge 13 --squash', 'https://github.com/acme/app/pull/14'], undefined])
+  expect(withPullLinks(beats, 'https://gitlab.com/acme/app.git')).toEqual(beats)
+  // A thing that was already waiting, told of before there was anything to do it with, gains it when it is told of again.
+  const bare = feedIn(trail, job, beats.map(({ refs: _, ...beat }) => beat))
+  expect(waitsOf(bare).map(beat => beat.refs)).toEqual([undefined, undefined])
+  expect(waitsOf(feedIn(bare, job, linked)).map(beat => beat.refs?.length)).toEqual([3, undefined])
+  const row = layout(feedIn(trail, job, linked), { width: 58, picked: NOBODY, page: 0, mode: 'questions', zone: 0 }).rows.find(found => found.kind === 'line' && found.key === 'w:s1:0')
+  expect(row?.kind === 'line' && row.refs).toEqual(['https://github.com/acme/app/pull/13', 'gh pr merge 13 --squash', 'https://github.com/acme/app/pull/14'])
 })
 
 test('a trail read back from its transcript keeps the updates and the answers only the mod knew', () => {
@@ -595,9 +652,9 @@ test('each picture is asked about by what the conversation can tell it by, and t
   const captioned = told.reduce((now, one) => add(now, { t: 'caption', id: one.id, at: 1, text: one.text }), trail)
   expect(captioned.items.filter(item => item.kind === 'shot').map(item => item.shot?.note)).toEqual([told[0]!.text, '', told[2]!.text, ''])
   expect(captionJob(captioned, () => '')).toBeNull()
-  // The caption reads under the picture's name, in either view; and it outlives the trail being read back from its transcript.
-  const row = layout(captioned, { width: 58, picked: NOBODY, page: 0, mode: 'feed', zone: 0 }).rows.find(found => found.kind === 'line' && found.key === 'p1:1:shot')
-  expect(row?.kind === 'line' && [row.lines[0], row.lines.slice(1).join(' ')]).toEqual(['You pasted a picture', told[0]!.text])
+  // The caption reads under the output's name, and it outlives the trail being read back from its transcript.
+  const row = layout(captioned, { width: 58, picked: NOBODY, page: 0, mode: 'outputs', zone: 0 }).rows.find(found => found.kind === 'line' && found.key === 't1:shot')
+  expect(row?.kind === 'line' && row.lines.slice(1).join(' ')).toBe(told[2]!.text)
   expect(adopt(trail, captioned).items.find(item => item.id === 't1:shot')?.shot?.note).toBe(told[2]!.text)
   // Pictures from before the context was compacted are no longer the conversation's to describe.
   const compacted = add(trail, { t: 'compact', id: 'c1', at: Date.parse('2026-10-03T21:00:00Z') })
@@ -630,8 +687,12 @@ test('whatever the work produced is an output: pictures, the videos a command ma
     ['▶', 'film.mp4', '/work/out/film.mp4'],
     ['▣', 'still_20.png', '/shots/t1.full.png'],
   ])
-  expect(page.rows.flatMap(found => (found.kind === 'line' && found.picture ? [found.key] : []))).toEqual(['out:abc:1:shot', 't1:shot'])
-  expect(page.foot).toBe('4 outputs · quiet since Thu Jan 1 00:00')
+  // Nothing is drawn: each is told of in words, in bold until the person has opened it and dimmed once they have.
+  expect(page.rows.flatMap(found => (found.kind === 'line' ? [found.tone] : []))).toEqual(['ask', 'ask', 'ask', 'ask'])
+  const once = add(trail, { t: 'opened', id: 'out:abc:1:shot', at: 7000 })
+  expect(layout(once, { width: 58, picked: NOBODY, page: 0, mode: 'outputs', zone: 0 }).rows.flatMap(found => (found.kind === 'line' ? [found.tone] : []))).toEqual(['ask', 'ask', 'quiet', 'ask'])
+  expect(layout(once, { width: 58, picked: NOBODY, page: 0, mode: 'outputs', zone: 0 }).foot).toBe('4 outputs (3 not opened) · quiet since Thu Jan 1 00:00')
+  expect(page.foot).toBe('4 outputs (4 not opened) · quiet since Thu Jan 1 00:00')
 
   // The outputs are Claude's own: a picture the person pasted, or a file from before the session that Claude only looked at, is not one.
   const shown = folded([
@@ -642,8 +703,9 @@ test('whatever the work produced is an output: pictures, the videos a command ma
   ])
   const own = (mode: 'outputs' | 'feed') => layout(shown, { width: 58, picked: NOBODY, page: 0, mode, zone: 0 }).rows.flatMap(found => (found.kind === 'line' && found.open ? [found.lines[0]] : []))
   expect(own('outputs')).toEqual(['render.png'])
-  expect(own('feed')).toEqual(['render.png', 'reference.png', 'You pasted a picture'])
-  expect(layout(shown, { width: 58, picked: NOBODY, page: 0, mode: 'outputs', zone: 0 }).foot).toBe('1 output · working now')
+  // None of them is part of the feed, which is what was done and nothing else.
+  expect(own('feed')).toEqual([])
+  expect(layout(shown, { width: 58, picked: NOBODY, page: 0, mode: 'outputs', zone: 0 }).foot).toBe('1 output (1 not opened) · working now')
 
   // Read back from a transcript: a video is the session's if it was written while the command that names it ran.
   const rows = [
@@ -660,13 +722,9 @@ test('whatever the work produced is an output: pictures, the videos a command ma
   expect(sent.get('toolu_s:0')).toBe('/work/out/film.mp4')
   // What Claude said as it sent a file is read back as that file's caption.
   const withSaid = eventsFromRows(rows.map(line => JSON.stringify(line.uuid === 'a2' ? { ...line, message: { content: [{ type: 'tool_use', id: 'toolu_s', name: 'SendUserFile', input: { files: ['/work/out/film.mp4'], caption: 'The finished film.' } }] } } : line))).events
-  const read = folded(withSaid.map(event => (event.t === 'shot' && event.type !== 'link' ? { ...event, file: '/kept.png', w: 16, h: 9 } : event)))
-  const sentPage = layout(read, { width: 58, picked: NOBODY, page: 0, mode: 'sent', zone: 0 })
-  expect(sentPage.rows.flatMap(found => (found.kind === 'line' ? [[found.glyph, found.lines.join(' | '), found.open !== undefined, found.picture !== undefined]] : []))).toEqual([
-    ['↗', 'Published index.html', true, false],
-    ['▶', 'film.mp4 | The finished film.', true, true],
-  ])
-  expect(sentPage.foot).toBe('2 sent to you · working now')
+  const read = folded(withSaid)
+  const told = layout(read, { width: 58, picked: NOBODY, page: 0, mode: 'outputs', zone: 0 }).rows.find(found => found.kind === 'line' && found.lines.join(' ').includes('The finished film.'))
+  expect(told?.kind === 'line' && [told.glyph, told.lines.join(' | ')]).toEqual(['▶', 'Sent you film.mp4 | The finished film.'])
   expect(events.flatMap(event => (event.t === 'shot' ? [[event.label, event.type, event.full]] : []))).toEqual([
     ['film.mp4', 'video', undefined],
     ['Sent you film.mp4', 'video', undefined],
@@ -693,8 +751,6 @@ test('a question waits until the person answers it, in the pane or by simply say
 test('the page reads from the latest back, by the clock: questions waiting, then what each request came to, over what happened, over the request', () => {
   expect(wrap('one two three four five six', 9, 2)).toEqual(['one two', 'three…'])
   expect(wrap('short', 20, 3)).toEqual(['short'])
-  expect(pictureBox(1440, 900, 50)).toEqual({ columns: 45, rows: 14 })
-  expect(pictureBox(1600, 400, 50)).toEqual({ columns: 50, rows: 6 })
   expect(zoneOf('-1000\n')).toBe(-600)
   expect(zoneOf('+0530')).toBe(330)
   expect(zoneOf('PST')).toBeUndefined()
@@ -713,25 +769,25 @@ test('the page reads from the latest back, by the clock: questions waiting, then
     { t: 'tool', id: 't5', at: at('03:06:00'), tool: 'Bash', note: 'Play it through' },
   ])
   const look = { width: 48, picked: NOBODY, page: 0, zone: -600 }
-  // Each row by what it is; a line that has its picture drawn says so.
-  const kinds = (mode: 'feed' | 'steps') => layout(trail, { ...look, mode }).rows.map(found => (found.kind === 'line' ? found.key + (found.picture ? ' +picture' : '') : found.kind))
+  // Each row by what it is.
+  const kinds = (mode: 'feed' | 'steps') => layout(trail, { ...look, mode }).rows.map(found => (found.kind === 'line' ? found.key : found.kind))
 
-  // Every step, strictly from the latest back: a request sits under the work it set off.
-  expect(kinds('steps')).toEqual(['day', 's3', 'p2', 's2', 't2:shot +picture', 't1:shot', 's1', 'p1'])
+  // Every prompt, from the latest back: the person's own side of the conversation, and nothing of what was done about it.
+  expect(kinds('steps')).toEqual(['day', 'p2', 'p1'])
   const steps = layout(trail, { ...look, mode: 'steps' })
   expect(steps.rows[0]).toMatchObject({ kind: 'day', text: 'Fri Oct 2' })
-  expect(steps.rows.flatMap(found => (found.kind === 'line' ? [found.time] : []))).toEqual(['17:05', '17:00', '16:39', '16:32', '16:32', '16:31', '16:30'])
+  expect(steps.rows.flatMap(found => (found.kind === 'line' ? [found.time] : []))).toEqual(['17:00', '16:30'])
   const first = steps.rows.find(found => found.kind === 'line' && found.key === 'p1')
   // How long the turn ran is said after what was asked, however long that is.
   expect(first?.kind === 'line' && [first.time, first.glyph, first.lines.length, first.lines.at(-1)?.endsWith('  (10m)'), first.tone]).toEqual(['16:30', '❯', 2, true, 'ask'])
   // Every entry has the same shape in every view: its mark, and its words set in by the mark's width under the first row.
   expect([...new Set(steps.rows.flatMap(found => (found.kind === 'line' ? [found.pad] : [])))]).toEqual([2])
-  // Of two pictures taken one after the other the last is drawn; each entry says where its whole picture is.
-  expect(steps.rows.flatMap(found => (found.kind === 'line' && found.open ? [found.open.full || found.open.file] : []))).toEqual(['/shots/b.png', '/shots/a.full.png'])
-  expect(steps.foot).toBe('3 steps · working now')
+  // A picture's entry, among the outputs, says where the thing itself is, to open.
+  expect(layout(trail, { ...look, mode: 'outputs' }).rows.flatMap(found => (found.kind === 'line' && found.open ? [found.open.full || found.open.file] : []))).toEqual(['/shots/b.png', '/shots/a.full.png'])
+  expect(steps.foot).toBe('2 prompts · working now')
 
-  // The feed is the updates and the pictures, and nothing else: no requests, no steps but the latest still untold.
-  expect(kinds('feed')).toEqual(['day', 's3', 't2:shot +picture', 't1:shot'])
+  // The feed is the updates and nothing else: with none written yet, it is empty.
+  expect(kinds('feed')).toEqual([])
   // The running request has said too little to be told yet; the finished one is what there is to tell.
   const job = nextJob(trail)!
   expect(job.ids).toEqual(['p1', 's1', 't1:shot', 't2:shot', 's2'])
@@ -739,21 +795,21 @@ test('the page reads from the latest back, by the clock: questions waiting, then
   trail = feedIn(trail, job, [{ id: 'b:s2', ref: 's2', turn: 1, at: at('02:39:00'), kind: 'summary', title: update, detail: '', anchor: 's2' }])
   trail = add(trail, { t: 'question', id: 'q1', at: at('03:07:00'), text: 'Is this the ending you wanted?', options: ['Yes', 'No'], shot: { file: '/shots/q.png', w: 720, h: 450 } })
   // A question waiting is no part of the feed: it has a view of its own.
-  expect(kinds('feed')).toEqual(['day', 's3', 'b:s2', 't2:shot +picture', 't1:shot'])
+  expect(kinds('feed')).toEqual(['day', 'b:s2'])
   const feed = layout(trail, { ...look, mode: 'feed' })
-  // An update is read whole, with its time and no mark beside it; the step no update tells of yet is one dim line.
+  // An update is read whole, with its time and no mark beside it.
   const told = feed.rows.find(found => found.kind === 'line' && found.key === 'b:s2')
   expect(told?.kind === 'line' && [told.time, told.glyph, told.pad, told.tone, told.lines.join(' '), told.target.anchor]).toEqual(['16:39', ' ', 0, 'plain', update, 's2'])
   // An update is set across the pane, no line of it wider than the pane is.
   expect(told?.kind === 'line' && told.lines.every(text => text.length <= 48)).toBe(true)
-  const now = feed.rows.find(found => found.kind === 'line' && found.key === 's3')
-  expect(now?.kind === 'line' && [now.glyph, now.tone, now.work]).toEqual(['…', 'quiet', ''])
+  // A step no update tells of yet is not shown.
+  expect(feed.rows.some(found => found.kind === 'line' && found.key === 's3')).toBe(false)
   expect(feed.rows.some(found => found.kind === 'question')).toBe(false)
   expect(feed.foot).toBe('1 update · 1 waiting on you · working now')
   const asking = layout(trail, { ...look, mode: 'questions' })
   expect(asking.rows.map(found => found.kind)).toEqual(['question'])
   const question = asking.rows[0]
-  expect(question?.kind === 'question' && [question.lines, question.picture?.columns]).toEqual([['Is this the ending you wanted?'], 45])
+  expect(question?.kind === 'question' && question.lines).toEqual(['Is this the ending you wanted?'])
   expect(asking.foot).toBe('1 waiting on you · working now')
 
   // Answered, the question is a thing that happened: told among the steps with what was said, and nothing waits.
@@ -766,8 +822,6 @@ test('the page reads from the latest back, by the clock: questions waiting, then
   // An entry says nothing of a jump until one is asked for; then that it went, or why it did not.
   const gone = (jump?: string) => layout(trail, { ...look, mode: 'feed', picked: { id: 'b:s2', ...(jump === undefined ? {} : { jump }) } }).rows.find(found => found.kind === 'line' && found.key === 'b:s2')
   expect([gone(), gone(''), gone('none scrolls')].map(found => found?.kind === 'line' && found.note)).toEqual(['', 'the conversation is at this point now', "can't go there: none scrolls"])
-  // A picture whose entry was last pressed is drawn, though it is not the last of its run.
-  expect(layout(trail, { ...look, mode: 'feed', picked: { id: 't1:shot' } }).rows.filter(found => found.kind === 'line' && found.picture)).toHaveLength(2)
   // A request too long for its rows offers more, and shows all of itself once asked.
   const asked = (isOpen: boolean) => layout(trail, { ...look, mode: 'steps', picked: { id: 'p1', isOpen } }).rows.find(found => found.kind === 'line' && found.key === 'p1')
   const [short, whole] = [asked(false), asked(true)]
@@ -784,18 +838,18 @@ test('a long trail pages from the newest back, every line once', () => {
   }
   const keysOf = (page: number) => layout(trail, { width: 58, picked: NOBODY, page, mode: 'steps', zone: 0 }).rows.flatMap(found => (found.kind === 'line' ? [found.key] : []))
   const first = layout(trail, { width: 58, picked: NOBODY, page: 0, mode: 'steps', zone: 0 })
-  expect(keysOf(0).slice(0, 2)).toEqual(['s149', 'p149'])
-  expect([first.later, first.earlier]).toEqual([0, 180])
-  const seen = new Set([...keysOf(0), ...keysOf(1), ...keysOf(2), ...keysOf(3)])
-  expect(seen.size).toBe(300)
-  expect(keysOf(3).at(-1)).toBe('p0')
+  expect(keysOf(0).slice(0, 2)).toEqual(['p149', 'p148'])
+  expect([first.later, first.earlier]).toEqual([0, 30])
+  const seen = new Set([...keysOf(0), ...keysOf(1)])
+  expect(seen.size).toBe(150)
+  expect(keysOf(1).at(-1)).toBe('p0')
 })
 
-test('what is past keeping: the pictures of a session idle a week, the folder of one idle as long as a transcript is kept', () => {
+test('what is past keeping: the pictures an older version left in a session idle a day, the folder of one idle as long as a transcript is kept', () => {
   const DAY = 86_400_000
   const id = (n: number) => `00000000-0000-4000-8000-00000000000${n}`
   const kept = [
-    { name: id(1), touchedAt: NOW - 2 * DAY, hasShots: true },
+    { name: id(1), touchedAt: NOW - DAY / 2, hasShots: true },
     { name: id(2), touchedAt: NOW - 8 * DAY, hasShots: true },
     { name: id(3), touchedAt: NOW - 8 * DAY, hasShots: false },
     { name: id(4), touchedAt: NOW - 31 * DAY, hasShots: true },
@@ -813,7 +867,7 @@ test('what is past keeping: the pictures of a session idle a week, the folder of
   expect([sized(12), sized(2048), sized(146_000), sized(3_400_000)]).toEqual(['12 KB', '2 MB', '143 MB', '3.2 GB'])
   // A whole-size copy goes a week after it was made; the small copy beside it, and anything not named as a copy, stays.
   const file = (name: string, days: number, kind = 'file') => ({ name, kind, mtimeMs: NOW - days * DAY })
-  expect(staleCopies([file('toolu_1.full.png', 8), file('toolu_1.png', 8), file('toolu_2.full.jpeg', 6), file('toolu_3.full.jpg', 30), file('ql-out', 30, 'dir'), file('a b.full.png', 30), { name: 'toolu_4.full.png', kind: 'file', mtimeMs: 0 }], NOW)).toEqual(['toolu_1.full.png', 'toolu_3.full.jpg'])
+  expect(staleCopies([file('toolu_1.full.png', 8), file('toolu_1.png', 8), file('toolu_2.full.jpeg', 0.5), file('toolu_3.full.jpg', 30), file('ql-out', 30, 'dir'), file('a b.full.png', 30), { name: 'toolu_4.full.png', kind: 'file', mtimeMs: 0 }], NOW)).toEqual(['toolu_1.full.png', 'toolu_3.full.jpg'])
 })
 
 test('a jump tries the folded run a call sits in, then the row, then the tool call beside it, and stops at the first that moves', async () => {
@@ -841,9 +895,9 @@ test('a jump tries the folded run a call sits in, then the row, then the tool ca
 
 // ------------------------------------------------------------ the mod in the engine
 
-test('a turn is recorded, its picture kept, and once it ends a model writes the update the pane shows', async ($, on) => {
+test('a turn is recorded, its picture noted where it lies, and once it ends a model writes the update the pane shows', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
-  const { files, ran, asked, forked, made } = engine(on, '1|You asked for the login flow to work end to end. Claude added the session cookie and it now does; every test passes.', '1|The login form after sign-in, opened to check the session cookie held.')
+  const { files, ran, asked, forked, made, showing } = engine(on, '1|Added the session cookie ; Login works end to end, every test passing\npic|p1|The login form after sign-in, opened to check the session cookie held.', '1|Never asked for.')
   made.add('/work/shots/login.png')
 
   await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
@@ -854,73 +908,77 @@ test('a turn is recorded, its picture kept, and once it ends a model writes the 
   // A subagent's rows are its own business.
   await appended($.session.append(row('response', 'row-agent', 'I am a subagent and should not be here.', 'agent-1')))
 
-  // While the turn runs there is nothing to tell yet: the feed shows the latest step, the other view all of them.
+  // While the turn runs there is nothing to tell yet: the feed is empty and the line under the tabs says work is going on.
   await clock.advance(1000)
   const early = await $.ui.mount(pane('terminal'))
-  expect(await early.find({ type: 'Text', text: '… The auth module is read. Now the session cookie.' })).toBeDefined()
+  expect(await early.find({ type: 'Text', text: /The auth module is read/ })).toBeUndefined()
+  expect(await early.find({ type: 'Text', text: /working now$/ })).toBeDefined()
   expect(await early.find({ key: 'go:row-ask' })).toBeUndefined()
   await early.press({ key: 'tab:steps' })
+  // The last view is what the person asked, each with the way to its place in the conversation, and nothing of the steps.
   expect(await early.find({ type: 'Text', text: '❯ make the login flow work end to end' })).toBeDefined()
-  expect(await early.find({ type: 'Text', text: /└ 1 command · 1 read/ })).toBeDefined()
-  expect(await early.find({ key: 'go:row-agent' })).toBeUndefined()
-  // Every entry has, beside its time, an arrow to its place in the conversation, the same in every view.
   expect((await early.find({ key: 'go:row-ask' }))?.props['label']).toBe('→')
-  expect((await early.find({ key: 'go:row-say' }))?.props['label']).toBe('→')
+  expect(await early.find({ key: 'go:row-say' })).toBeUndefined()
+  expect(await early.find({ key: 'go:row-agent' })).toBeUndefined()
   await early.press({ key: 'tab:feed' })
   await early.unmount()
   expect(asked).toHaveLength(0)
 
   await appended($.session.append(say('row-done', 'Login works end to end and every test passes.')))
+  // The pane is on screen when the turn ends, so the update is written.
+  showing.pane = true
   await $.turn.complete({ answer: 'Login works.', durationMs: 5, isAborted: false, turnId: 't1', reason: 'answer' })
   await clock.advance(5000)
 
-  // The picture was converted to a small PNG of the mod's own beside the trail's file. A file on disk is not copied whole.
-  const kept = `${DIR}/shots/toolu_read.png`
-  expect(ran).toContainEqual(['/usr/bin/sips', '-s', 'format', 'png', '-Z', '720', '/work/shots/login.png', '--out', kept])
-  expect(ran.some(([command]) => command === '/bin/cp')).toBe(false)
+  // Nothing of the picture was copied or converted: the trail only notes where it lies.
+  expect(ran.some(([command]) => command === '/usr/bin/sips' || command === '/bin/cp' || command === '/usr/bin/qlmanage')).toBe(false)
+  expect([...files.keys()].some(path => path.includes('/shots/'))).toBe(false)
   expect(JSON.parse(files.get(`${DIR}/trail.json`) ?? '{}')).toMatchObject({ v: 5, sid: SID })
   // The model was put the turn as a log, once.
   expect(asked).toHaveLength(1)
   expect(asked[0]).toContain('THE PERSON ASKED:\nmake the login flow work end to end')
   expect(asked[0]).toContain('[did: Run the tests; 1 command · 1 read]')
-  // The conversation was asked what its picture shows, once the turn had ended.
-  expect(forked).toHaveLength(1)
-  expect(forked[0]).toContain('1. the picture login.png, which you opened at ')
+  expect(asked[0]).toContain('[p1] looked at a picture: login.png')
+  // The conversation itself is never asked about its pictures unasked: that call reads all of it again.
+  expect(forked).toHaveLength(0)
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount(pane(surface))
-    // The feed is the update and the picture: what was asked and each step are the other view's.
-    expect(await ui.find({ type: 'Text', text: 'You asked for the login flow to work end to end. Claude' })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /it now does; every test$/ })).toBeDefined()
+    // The feed is the update, as short actions, and nothing else.
+    expect(await ui.find({ type: 'Text', text: '• Added the session cookie' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: '• Login works end to end, every test passing' })).toBeDefined()
     // The update's time stands on the row above it, with the way to its place in the conversation.
     expect(await ui.find({ type: 'Text', text: /^\d\d:\d\d$/ })).toBeDefined()
     expect((await ui.find({ key: 'go:b:row-done' }))?.props['label']).toBe('→')
     expect(await ui.find({ key: 'go:row-ask' })).toBeUndefined()
     expect(await ui.find({ key: 'go:row-say' })).toBeUndefined()
-    expect((await ui.find({ key: 'open:toolu_read:shot' }))?.props['label']).toBe('[open]')
     expect(await ui.find({ type: 'Text', text: /1 update · quiet since \w+ \w+ \d+ \d\d:\d\d$/ })).toBeDefined()
-    expect(await ui.find({ key: 'open:toolu_read:shot' })).toBeDefined()
+    expect(await ui.find({ key: 'open:toolu_read:shot' })).toBeUndefined()
+    // The picture is among the outputs. Nothing is drawn on any surface: the entry is its name, what the log said of it, and the way to open it.
+    await ui.press({ key: 'tab:outputs' })
+    expect(await ui.find({ type: 'Image' })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: '▣ login.png' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /The login form after sign-in, opened to check the/ })).toBeDefined()
-    const picture = await ui.find({ type: 'Image' })
-    if (surface === 'terminal') {
-      expect(picture?.props['source']).toEqual({ file: kept, format: 'png' })
-      expect(picture?.props['columns']).toBe(45)
-      expect(picture?.props['rows']).toBe(14)
-    } else expect(picture).toBeUndefined()
+    expect((await ui.find({ key: 'open:toolu_read:shot' }))?.props['label']).toBe('[open]')
+    await ui.press({ key: 'tab:feed' })
     await ui.unmount()
   }
 
   const ui = await $.ui.mount(pane('terminal'))
-  // Opening a picture hands the file itself to the person's viewer, while it is still the picture that was kept.
+  // Opening a picture hands the file itself to the person's viewer, and the entry is read from then on.
+  await ui.press({ key: 'tab:outputs' })
   await ui.press({ key: 'open:toolu_read:shot' })
   expect(ran.filter(([command]) => command === '/usr/bin/open')).toEqual([['/usr/bin/open', '/work/shots/login.png']])
-  // Gone, or written over since, it is the small copy the mod kept that opens.
+  const read = () => (JSON.parse(files.get(`${DIR}/trail.json`) ?? '{}') as { trail: { items: { id: string; shot?: { opened?: number } }[] } }).trail.items.find(item => item.id === 'toolu_read:shot')?.shot?.opened
+  expect(typeof read()).toBe('number')
+  // Gone, or written over since, there is nothing of the mod's own to open in its place.
   made.delete('/work/shots/login.png')
   await ui.press({ key: 'open:toolu_read:shot' })
-  expect(ran.filter(([command]) => command === '/usr/bin/open').at(-1)).toEqual(['/usr/bin/open', kept])
-  // Every step is one key away.
+  expect(ran.filter(([command]) => command === '/usr/bin/open')).toHaveLength(1)
+  // What the person asked is one key away.
   await ui.press({ key: 'tab:steps' })
-  expect(await ui.find({ type: 'Text', text: '• The auth module is read. Now the session cookie.' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '❯ make the login flow work end to end' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /The auth module is read/ })).toBeUndefined()
   expect(await ui.find({ key: 'go:b:row-done' })).toBeUndefined()
   await ui.press({ key: 'tab:feed' })
   expect(await ui.find({ type: 'Text', text: /^\s*can't go there: / })).toBeUndefined()
@@ -930,7 +988,7 @@ test('a turn is recorded, its picture kept, and once it ends a model writes the 
   await ui.unmount()
 })
 
-test('a video a command makes and a file Claude sends show among the outputs, each with its preview and the way to open it', async ($, on) => {
+test('a video a command makes and a file Claude sends show among the outputs, each by name with the way to open it', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const { ran, made } = engine(on)
 
@@ -942,37 +1000,38 @@ test('a video a command makes and a file Claude sends show among the outputs, ea
   await $.tool.call({ tool: 'SendUserFile', tool_use_id: 'toolu_send', files: ['/work/out/demo.mp4'], caption: 'The demo, start to finish: 40 seconds.', status: 'normal' })
   await clock.advance(1000)
 
-  const rendered = ran.find(argv => argv[0] === '/usr/bin/qlmanage' && argv[6] === '/work/out/demo.mp4')
-  expect(rendered?.slice(0, 5)).toEqual(['/usr/bin/qlmanage', '-t', '-s', '720', '-o'])
+  // No preview is made of either: they are told of by name.
+  expect(ran.some(argv => argv[0] === '/usr/bin/qlmanage')).toBe(false)
   expect(ran.some(argv => argv.includes('/old/reference.mov'))).toBe(false)
 
   const ui = await $.ui.mount(pane('terminal'))
   await ui.press({ key: 'tab:outputs' })
   expect((await ui.findAll({ type: 'Text', text: /demo\.mp4/ })).map(found => found.text)).toEqual(['▶ Sent you demo.mp4', '▶ demo.mp4'])
-  expect(await ui.findAll({ type: 'Image' })).toHaveLength(2)
-  expect(await ui.find({ type: 'Text', text: /2 outputs · working now/ })).toBeDefined()
+  expect(await ui.findAll({ type: 'Image' })).toHaveLength(0)
+  expect(await ui.find({ type: 'Text', text: /2 outputs \(2 not opened\) · working now/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /The demo, start to finish: 40 seconds\./ })).toBeDefined()
   // Opening the sent video plays the file itself, where it lies.
   await ui.press({ key: 'open:toolu_send:0:shot' })
   expect(ran).toContainEqual(['/usr/bin/open', '/work/out/demo.mp4'])
-  // What Claude sent has a view of its own: the file by its name, what Claude said of it, its preview, the way to open it.
-  await ui.press({ key: 'tab:sent' })
-  expect((await ui.findAll({ type: 'Text', text: /demo\.mp4/ })).map(found => found.text)).toEqual(['▶ demo.mp4'])
-  expect(await ui.find({ type: 'Text', text: /The demo, start to finish: 40 seconds\./ })).toBeDefined()
-  expect(await ui.findAll({ type: 'Image' })).toHaveLength(1)
-  expect(await ui.find({ type: 'Text', text: /1 sent to you · working now/ })).toBeDefined()
+  // Opened, it is read: one is left unopened.
+  expect(await ui.find({ type: 'Text', text: /2 outputs \(1 not opened\) · working now/ })).toBeDefined()
   expect((await ui.find({ key: 'open:toolu_send:0:shot' }))?.props['label']).toBe('[open]')
   expect((await ui.find({ key: 'go:toolu_send:0:shot' }))?.props['label']).toBe('→')
   // The other views are a key away, and the one shown is marked.
-  await ui.press({ key: 'tab:done' })
-  expect(await ui.find({ type: 'Text', text: /No big task finished yet/ })).toBeDefined()
-  expect(await ui.find({ key: 'tab:done' })).toBeUndefined()
+  await ui.press({ key: 'tab:steps' })
+  expect(await ui.find({ type: 'Text', text: '❯ render the demo and send it to me' })).toBeDefined()
+  expect(await ui.find({ key: 'tab:steps' })).toBeUndefined()
   expect(await ui.find({ key: 'tab:outputs' })).toBeDefined()
+  // There is no view of things sent or of big tasks done any more.
+  expect(await ui.find({ key: 'tab:sent' })).toBeUndefined()
+  expect(await ui.find({ key: 'tab:done' })).toBeUndefined()
   await ui.unmount()
 })
 
 test('a thing Claude says is waiting on the person gets the tab for what waits, and [done] takes it away', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
-  engine(on, '1|You asked where the branches stand. PR 7 is mergeable; the packaging branch is held up.\nwait|1|Run `gh auth refresh -s workflow` so the packaging branch can be pushed', '')
+  const { showing } = engine(on, '1|Checked the branches: PR 7 mergeable, packaging held up\nwait|1|Run `gh auth refresh -s workflow` so the packaging branch can be pushed', '')
+  showing.pane = true
 
   await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
   await appended($.session.append(ask('row-ask', 'where do the branches stand?')))
@@ -981,24 +1040,19 @@ test('a thing Claude says is waiting on the person gets the tab for what waits, 
   await clock.advance(5000)
 
   const ui = await $.ui.mount(pane('terminal'))
-  // It is the first thing the feed says, under a heading of its own, with the way to say it is done.
-  expect(await ui.find({ type: 'Text', text: /^Waiting on you ─+$/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: '○ Run `gh auth refresh -s workflow` so the packaging' })).toBeDefined()
-  expect((await ui.find({ key: 'settle:w:row-say:0' }))?.props['label']).toBe('[done]')
-  // The tab for what waits is there too, with its count, and the line under the tabs says so.
+  // It is no part of the feed. The tab for what waits is there, with its count, and the line under the tabs says so.
+  expect(await ui.find({ key: 'settle:w:row-say:0' })).toBeUndefined()
   expect((await ui.find({ key: 'tab:questions' }))?.props['label']).toBe('1 waiting on you')
   expect(await ui.find({ type: 'Text', text: /^1 update · 1 waiting on you · quiet since / })).toBeDefined()
   await ui.press({ key: 'tab:questions' })
-  expect(await ui.find({ type: 'Text', text: /^Waiting on you ─+$/ })).toBeUndefined()
   expect(await ui.find({ type: 'Text', text: '○ Run `gh auth refresh -s workflow` so the packaging' })).toBeDefined()
   expect((await ui.find({ key: 'settle:w:row-say:0' }))?.props['label']).toBe('[done]')
   expect((await ui.find({ key: 'go:w:row-say:0' }))?.props['label']).toBe('→')
   // Said to be done, it waits no more: the tab goes, and the pane is back at the feed.
   await ui.press({ key: 'settle:w:row-say:0' })
   expect(await ui.find({ key: 'tab:questions' })).toBeUndefined()
-  expect(await ui.find({ type: 'Text', text: /^Waiting on you ─+$/ })).toBeUndefined()
   expect(await ui.find({ type: 'Text', text: /^1 update · quiet since / })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: 'You asked where the branches stand. PR 7 is mergeable;' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^• Checked the branches: PR 7 mergeable/ })).toBeDefined()
   await ui.unmount()
 })
 
@@ -1010,23 +1064,23 @@ test('once a day a starting session clears what other sessions left that is past
   const [recent, idle, old] = ['11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222', '33333333-3333-4333-8333-333333333333']
   const folder = (name: string) => ({ name, kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false })
   listed.set(root, [folder(SID), folder(recent), folder(idle), folder(old), { name: 'stray.txt', kind: 'file', size: 4, mtimeMs: NOW - 400 * DAY, isLink: false }])
-  written.set(`${root}/${recent}/trail.json`, NOW - DAY)
+  written.set(`${root}/${recent}/trail.json`, NOW - DAY / 4)
   written.set(`${root}/${idle}/trail.json`, NOW - 9 * DAY)
   written.set(`${root}/${old}/trail.json`, NOW - 40 * DAY)
   for (const name of [recent, idle, old]) files.set(`${root}/${name}/shots`, '')
   const picture = (name: string, days: number) => ({ name, kind: 'file' as const, size: 9000, mtimeMs: NOW - days * DAY, isLink: false })
-  listed.set(`${root}/${recent}/shots`, [picture('toolu_a.full.png', 8), picture('toolu_a.png', 8), picture('toolu_b.full.png', 2)])
+  listed.set(`${root}/${recent}/shots`, [picture('toolu_a.full.png', 8), picture('toolu_a.png', 8), picture('toolu_b.full.png', 0.5)])
 
   await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
   await appended($.session.append(ask('row-ask', 'hello')))
   await clock.advance(10_000)
   const removed = () => ran.filter(([command, flag]) => command === '/bin/rm' && flag === '-rf')
-  // A session idle past the days a transcript is kept goes whole; one idle a week keeps its trail and loses its pictures.
+  // A session idle past the days a transcript is kept goes whole; one idle a day keeps its trail and loses the pictures an older version left it.
   expect(removed()).toEqual([
     ['/bin/rm', '-rf', `${root}/${old}`],
     ['/bin/rm', '-rf', `${root}/${idle}/shots`],
   ])
-  // In a session that stays, only the whole-size copies made a week ago or more go.
+  // In a session that stays, only the whole-size copies made a day ago or more go.
   expect(ran.filter(([command, flag]) => command === '/bin/rm' && flag === '-f' && String(ran).includes('.full.'))).toContainEqual(['/bin/rm', '-f', `${root}/${recent}/shots/toolu_a.full.png`])
   expect(ran.flat().some(arg => arg.endsWith('toolu_a.png') || arg.endsWith('toolu_b.full.png'))).toBe(false)
   // It is done once a day, whichever session comes to it: the module starting again does not do it again.
@@ -1035,40 +1089,161 @@ test('once a day a starting session clears what other sessions left that is past
   expect(removed()).toHaveLength(2)
 })
 
-test('/trail off stops every model call while the steps are still noted, and /trail on writes what was missed', async ($, on) => {
+test('a closed pane costs nothing; opened, it writes the latest of what was missed, and what is further back only when asked', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
-  const { asked, forked } = engine(on, '1|You asked for the cache to be cleared. Claude cleared it and the build passes again.', '1|A picture.')
+  const { asked, forked, showing } = engine(on, '1|An update of the stretch.', '1|A picture.')
+  const typed = (args: string) => $.command.run({ command: 'trail', args, origin: PERSON, presentation: { isFullscreen: true, columns: 200 } })
+  const LONG = 'The renderer is being ported one part at a time, and each part is checked against the reference frames before the next is begun. '.repeat(2)
+
+  await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+  // A long turn and then a short one, both with the pane closed.
+  await appended($.session.append(ask('row-a1', 'port the renderer')))
+  for (let part = 0; part < 44; part++) {
+    await appended($.session.append(say(`row-s${part}`, `Part ${part}. ${LONG}`)))
+    await $.tool.call({ tool: 'Bash', tool_use_id: `toolu_${part}`, command: 'make', description: `Build part ${part}` })
+  }
+  await appended($.session.append(say('row-d1', 'All parts are ported.')))
+  await $.turn.complete({ answer: 'Ported.', durationMs: 5, isAborted: false, turnId: 't1', reason: 'answer' })
+  await appended($.session.append(ask('row-a2', 'clear the cache and rebuild')))
+  await appended($.session.append(say('row-s2', 'The cache is cleared.')))
+  await $.tool.call({ tool: 'Bash', tool_use_id: 'toolu_make', command: 'make', description: 'Build it' })
+  await appended($.session.append(say('row-d2', 'The build passes again.')))
+  await $.turn.complete({ answer: 'Done.', durationMs: 5, isAborted: false, turnId: 't2', reason: 'answer' })
+  await clock.advance(60_000)
+  // No model was asked for anything while nobody had the feed in front of them.
+  expect([asked.length, forked.length]).toEqual([0, 0])
+
+  // Opened, it writes the latest: the short turn. The long one before it is history, there to be asked for.
+  showing.pane = true
+  await typed('')
+  await clock.advance(20_000)
+  expect(asked).toHaveLength(1)
+  expect(asked[0]).toContain('clear the cache and rebuild')
+  expect(asked[0]).not.toContain('port the renderer')
+  expect(forked).toHaveLength(0)
+  const ui = await $.ui.mount(pane('terminal'))
+  expect(await ui.find({ type: 'Text', text: '• An update of the stretch' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^\d+ earlier steps have no summary$/ })).toBeDefined()
+  expect((await ui.find({ key: 'write-earlier' }))?.props['label']).toBe('[summarise]')
+  // Every step is there all the same: noting them cost nothing.
+  await ui.press({ key: 'tab:steps' })
+  expect(await ui.find({ type: 'Text', text: '❯ port the renderer' })).toBeDefined()
+  await ui.press({ key: 'tab:feed' })
+  await clock.advance(60_000)
+  expect(asked).toHaveLength(1)
+
+  // Asked for, the history is written, and then there is nothing left to ask for.
+  await ui.press({ key: 'write-earlier' })
+  await clock.advance(60_000)
+  expect(asked.length).toBeGreaterThan(1)
+  expect(asked.at(-1)).toContain('port the renderer')
+  expect(await ui.find({ key: 'write-earlier' })).toBeUndefined()
+  await ui.unmount()
+
+  // Closed again, a new turn is noted and nothing is asked.
+  showing.pane = false
+  const before = asked.length
+  await appended($.session.append(ask('row-a3', 'and run the tests')))
+  await appended($.session.append(say('row-d3', 'They pass.')))
+  await $.turn.complete({ answer: 'They pass.', durationMs: 5, isAborted: false, turnId: 't3', reason: 'answer' })
+  await clock.advance(60_000)
+  expect(asked).toHaveLength(before)
+})
+
+test('a picture is captioned from the log along with the update; the conversation is asked what it shows only on /trail describe', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const { asked, forked, made, showing } = engine(on, '1|Opened the login form: it renders\npic|p1|The login form, opened to check it renders.', '1|The login form with both fields empty and the Sign in button greyed out.')
+  made.add('/work/shots/login.png')
   const typed = (args: string) => $.command.run({ command: 'trail', args, origin: PERSON, presentation: { isFullscreen: true, columns: 200 } })
 
   await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
-  expect((await typed('off')).text).toContain('Trail is off in every session')
-  await appended($.session.append(ask('row-ask', 'clear the cache and rebuild')))
-  await appended($.session.append(say('row-say', 'The cache is cleared.')))
-  await $.tool.call({ tool: 'Bash', tool_use_id: 'toolu_bash', command: 'make', description: 'Build it' })
-  await appended($.session.append(say('row-done', 'The build passes again.')))
-  await $.turn.complete({ answer: 'Done.', durationMs: 5, isAborted: false, turnId: 't1', reason: 'answer' })
+  await appended($.session.append(ask('row-ask', 'show me the login form')))
+  await appended($.session.append(say('row-say', 'Opening the login form.')))
+  await $.tool.call({ tool: 'Read', tool_use_id: 'toolu_read', file_path: '/work/shots/login.png' })
+  await appended($.session.append(say('row-done', 'The form renders.')))
+  await $.turn.complete({ answer: 'It renders.', durationMs: 5, isAborted: false, turnId: 't1', reason: 'answer' })
   await clock.advance(20_000)
-  // No model was asked for anything; the steps are there all the same, and the pane says why there are no updates.
+  // The turn ended with the pane closed: nothing was asked, of a model or of the conversation.
   expect([asked.length, forked.length]).toEqual([0, 0])
+
+  // Opened, one small call writes the update and the caption; the conversation is not read again for it.
+  showing.pane = true
+  await typed('')
+  await clock.advance(20_000)
+  expect([asked.length, forked.length]).toEqual([1, 0])
+  expect(asked[0]).toContain('[p1] looked at a picture: login.png')
   const ui = await $.ui.mount(pane('terminal'))
-  expect(await ui.find({ type: 'Text', text: /· updates are off: \/trail on$/ })).toBeDefined()
-  await ui.press({ key: 'tab:steps' })
-  expect(await ui.find({ type: 'Text', text: '❯ clear the cache and rebuild' })).toBeDefined()
+  await ui.press({ key: 'tab:outputs' })
+  expect(await ui.find({ type: 'Text', text: /The login form, opened to check it renders\./ })).toBeDefined()
   await ui.press({ key: 'tab:feed' })
   await ui.unmount()
 
-  expect((await typed('on')).text).toContain('Trail is on')
-  await clock.advance(5000)
-  expect(asked).toHaveLength(1)
+  // Asked for, the conversation says what the picture shows, and that replaces the caption made out from the log.
+  expect((await typed('describe')).text).toBe('Trail asked the conversation what its pictures show: 1 captioned.')
+  expect(forked).toHaveLength(1)
   const after = await $.ui.mount(pane('terminal'))
-  expect(await after.find({ type: 'Text', text: /^You asked for the cache to be cleared\./ })).toBeDefined()
-  expect(await after.find({ type: 'Text', text: /updates are off/ })).toBeUndefined()
+  await after.press({ key: 'tab:outputs' })
+  expect(await after.find({ type: 'Text', text: /The login form with both fields empty and the Sign in/ })).toBeDefined()
+  expect(await after.find({ type: 'Text', text: /opened to check it renders/ })).toBeUndefined()
   await after.unmount()
+  expect((await typed('describe')).text).toBe('Every recent picture already has a caption from the conversation itself.')
+  expect(forked).toHaveLength(1)
 })
 
-test('Claude asks in the pane, under a picture; the answer pressed there goes back as the person’s next message', async ($, on) => {
+test('a session nobody is at (claude -p, a script) is not noted, kept or put to a model', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
-  const { ran, sent } = engine(on)
+  const { files, ran, asked, forked } = engine(on, '1|An update nobody would read.')
+  // The engine's own start hook may come before the session's start: a session that draws nowhere is known by that too.
+  on('session.surfaces', () => ({ value: [] }))
+  await ($ as unknown as { classic: { SessionStart: (e: Record<string, unknown>) => Promise<unknown> } }).classic.SessionStart({ session_id: SID, source: 'startup', hook_event_name: 'SessionStart' }).catch(() => undefined)
+  await $.session.start({ cwd: '/work', surface: null, isInteractive: false })
+  await appended($.session.append(ask('row-ask', 'summarise this file')))
+  await appended($.session.append(say('row-say', 'Reading it.')))
+  await $.tool.call({ tool: 'Bash', tool_use_id: 'toolu_bash', command: 'cat notes.md', description: 'Read the notes' })
+  await appended($.session.append(say('row-done', 'It is a list of three notes.')))
+  await $.turn.complete({ answer: 'Three notes.', durationMs: 5, isAborted: false, turnId: 't1', reason: 'answer' })
+  await clock.advance(30_000)
+  expect([files.size, ran.length, asked.length, forked.length]).toEqual([0, 0, 0, 0])
+})
+
+test('under a thing waiting, a link opens in the browser and a command is copied, never run', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const { ran, showing } = engine(on, '1|Readied PRs 13 and 14\nwait|1|Merge PR 13 first ::: gh pr merge 13 --squash', '')
+  const copied: string[] = []
+  on('session.repo', () => ({ value: { root: '/work', remote: 'git@github.com:acme/app.git', internal: false, name: null } }))
+  on('ui.copy', (_$, e) => {
+    copied.push(e.text)
+    return { value: { isCopied: true } }
+  })
+  showing.pane = true
+
+  await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+  await appended($.session.append(ask('row-ask', 'where do the pull requests stand?')))
+  await appended($.session.append(say('row-say', 'Both are ready. Merge PR 13 first, then tell me.')))
+  await $.turn.complete({ answer: 'Both are ready.', durationMs: 5, isAborted: false, turnId: 't1', reason: 'answer' })
+  await clock.advance(5000)
+
+  const ui = await $.ui.mount(pane('terminal'))
+  await ui.press({ key: 'tab:questions' })
+  expect(await ui.find({ type: 'Text', text: '○ Merge PR 13 first' })).toBeDefined()
+  // The pull request's link, made from the session's repository and the number, and the command the model gave.
+  expect(await ui.find({ type: 'Text', text: 'https://github.com/acme/app/pull/13' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'gh pr merge 13 --squash' })).toBeDefined()
+  expect((await ui.find({ key: 'link:w:row-say:0:0' }))?.props['label']).toBe('[open]')
+  expect((await ui.find({ key: 'copy:w:row-say:0:1' }))?.props['label']).toBe('[copy]')
+  await ui.press({ key: 'link:w:row-say:0:0' })
+  expect(ran).toContainEqual(['/usr/bin/open', 'https://github.com/acme/app/pull/13'])
+  await ui.press({ key: 'copy:w:row-say:0:1' })
+  expect(copied).toEqual(['gh pr merge 13 --squash'])
+  // The command went to the clipboard and nowhere else.
+  expect(ran.some(argv => argv.join(' ').includes('gh pr merge'))).toBe(false)
+  await ui.unmount()
+})
+
+test('Claude asks in the pane, about a picture it can be opened from; the answer pressed there goes back as the person’s next message', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const { ran, sent, made } = engine(on)
+  made.add('/work/shots/garage.jpg')
 
   await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
   await appended($.session.append(ask('row-ask', 'label the garage door')))
@@ -1076,14 +1251,17 @@ test('Claude asks in the pane, under a picture; the answer pressed there goes ba
   expect(String(told.result)).toContain("The question is in the person's Trail pane.")
   expect((await askInPane($, { tool_use_id: 'toolu_bad' })).isError).toBe(true)
   await clock.advance(1000)
-  expect(ran).toContainEqual(['/usr/bin/sips', '-s', 'format', 'png', '-Z', '720', '/work/shots/garage.jpg', '--out', `${DIR}/shots/q-toolu_q.png`])
+  expect(ran.some(([command]) => command === '/usr/bin/sips')).toBe(false)
 
   // The pane has turned to the question: a view of its own, there because something waits.
   const ui = await $.ui.mount(pane('terminal'))
   expect(await ui.find({ type: 'Text', text: /^ 1 waiting on you $/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /Claude is asking you/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'Is this the garage where you put the letter H?' })).toBeDefined()
-  expect((await ui.find({ type: 'Image' }))?.props['source']).toEqual({ file: `${DIR}/shots/q-toolu_q.png`, format: 'png' })
+  // The picture it is about is not drawn: the question has the way to open it.
+  expect(await ui.find({ type: 'Image' })).toBeUndefined()
+  await ui.press({ key: 'open:q:toolu_q' })
+  expect(ran).toContainEqual(['/usr/bin/open', '/work/shots/garage.jpg'])
   expect(await ui.find({ key: 'say:toolu_q' })).toBeDefined()
   // The other views do not show it; its tab stays among theirs while it waits.
   await ui.press({ key: 'tab:feed' })

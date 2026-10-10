@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import type { Beat, Mode, OutputType, Picked, Question, Saved, Shot, Source, Trail } from '../types'
-import { adopt, feedIn, nextJob, parseBeats, parseCleared, SYSTEM } from './digest.ts'
+import { adopt, backlogOf, feedIn, nextJob, parseBeats, parseCleared, parsePictures, SYSTEM, withPullLinks } from './digest.ts'
 import { captionJob, parseCaptions } from './caption.ts'
 import { candidates, reach } from './jump.ts'
 import { isSession, keepDays, prunable, sized, staleCopies } from './prune.ts'
@@ -17,18 +17,21 @@ import type { Target } from './view.ts'
  *
  * Hooks on the conversation's rows and tool calls feed `add`, which folds
  * them into steps: what was asked, what the model said it was doing with a
- * count of the work under it, the pictures it looked at, how each turn came
- * out. A model then reads the steps a stretch at a time and writes an update
- * for each, a few sentences on what was done and what came of it, the way a
- * match is told as it goes. Those updates, newest first, with the pictures
- * between them, are what the pane lists; every step is one key away. A line
- * is a Button: pressing it shows the way to its row in the transcript.
- * Claude can also put a question to the person in the pane, under a picture
- * if it is about one, and their answer goes back as their next message.
+ * count of the work under it, the pictures and files it looked at or made,
+ * how each turn came out. Noting these costs nothing. While the pane is
+ * showing, and only then, a model reads the steps a stretch at a time and
+ * writes an update for each, a few sentences on what was done and what came
+ * of it, the way a match is told as it goes, and says what is left waiting
+ * on the person. Those updates, newest first, with what the work produced
+ * between them, are what the pane lists; what the person asked is one key
+ * away. Nothing is drawn and nothing is copied: a picture or a file is told
+ * of in words and opened where it lies, and reads as new until it has been.
+ * Claude can also put a question to the person in the pane, and their answer
+ * goes back as their next message.
  *
- * The trail is kept in a file beside its pictures, by session, so it is there
- * when the session is opened again; a session that ran before the mod did is
- * read back from its transcript file by `tools/backfill.ts`.
+ * The trail is kept in a file, by session, so it is there when the session
+ * is opened again; a session that ran before the mod did is read back from
+ * its transcript file by `tools/backfill.ts`.
  */
 
 const PANE = 'trail'
@@ -39,24 +42,18 @@ const MARGIN = 1
 /** The pane is drawn again for a change no more often than this. */
 const PUSH_MS = 800
 const SAVE_MS = 5000
-/** The longer side of a kept picture, in pixels: sharp at the pane's width, small to hand to the terminal. */
-const THUMB_PX = '720'
-const SIPS = '/usr/bin/sips'
-const BASE64 = '/usr/bin/base64'
 const RM = '/bin/rm'
 const DU = '/usr/bin/du'
 /** How often, across every session on the machine, what is past keeping is looked for; and how long after a session starts. */
 const PRUNE_EVERY_MS = 86_400_000
 const PRUNE_AFTER_MS = 8000
+/** How often a drawing of the pane may set the writing of updates going. */
+const NUDGE_MS = 5000
 const COPIES_AT_ONCE = 40
-const CP = '/bin/cp'
 const OPEN = '/usr/bin/open'
-const QLMANAGE = '/usr/bin/qlmanage'
 const DATE = '/bin/date'
 const REBUILD_MS = 120_000
-const USAGE = 'Usage: /trail [close|off|on|rebuild|where]'
-/** What the line under the tabs says while the person has the model calls turned off. */
-const OFF = 'updates are off: /trail on'
+const USAGE = 'Usage: /trail [close|describe|rebuild|where]'
 const OPENED = 'Trail opened. Point at an entry and click the arrow beside its time to jump to it in the conversation.'
 /**
  * The way to an entry's place in the conversation: an arrow beside its time,
@@ -75,7 +72,6 @@ const DIGEST_RETRY_MS = 60_000
 const DIGEST_TIMEOUT_MS = 90_000
 const DIGEST_TOKENS = 1400
 /** Captions are asked for a little after a turn ends, while the conversation is fresh in the provider's cache. */
-const CAPTION_MS = 4000
 /**
  * The session's own model writes the updates: a stretch is a page of log and a few lines of reply, and a
  * small model was seen to report what was asked for as done. The small one stands in where the session's cannot be asked.
@@ -84,8 +80,8 @@ const DIGEST_FALLBACK = 'haiku'
 /** The tool as the model calls it. Matched by pattern: the engine's list of tool names is written before this one exists. */
 const ASK_TOOL = /^mcp__trail__ask$/
 const ASK_DESCRIPTION = [
-  'Puts a question to the person in their Trail side pane, where it stays until they answer, optionally under a picture it is about.',
-  'Use it whenever you need them to confirm or choose something, and always when the question is about an image: pass the image so they see it right above the question ("Is this the garage where you put the letter H?").',
+  'Puts a question to the person in their Trail side pane, where it stays until they answer, optionally with a picture it is about for them to open.',
+  'Use it whenever you need them to confirm or choose something, and always when the question is about an image: pass the image so they can open it from the question ("Is this the garage where you put the letter H?").',
   'It is the right way to ask when they may be away from the conversation. It does not wait: their answer arrives later as their next message, so end your turn if you cannot go on without it, or carry on with what does not depend on it.',
 ].join(' ')
 const ASK_SCHEMA = {
@@ -93,7 +89,7 @@ const ASK_SCHEMA = {
   properties: {
     question: { type: 'string', description: 'The question, in one or two plain sentences.' },
     options: { type: 'array', items: { type: 'string' }, description: 'Up to four short answers to offer as buttons, such as "Yes" and "No". They can always type their own.' },
-    image: { type: 'string', description: 'Absolute path of a picture (PNG, JPEG, GIF or WebP) to show above the question.' },
+    image: { type: 'string', description: 'Absolute path of a picture the question is about, for the person to open from it.' },
   },
   required: ['question'],
 }
@@ -131,7 +127,6 @@ let isRebuilding = false
 let journal: TrailEvent[] | null = null
 let pushTimer: Timer | null = null
 let lastSavedAt = 0
-let hasShotsDir = false
 
 let digestTimer: Timer | null = null
 let isDigesting = false
@@ -140,7 +135,30 @@ let digestModel = ''
 /** Steps a model was asked about and gave nothing readable for: they stay as steps rather than be asked about again. */
 const skipped = new Set<string>()
 
-let captionTimer: Timer | null = null
+/** The person asked for the updates of what went untold while the pane was closed: written until there are none left. */
+let wantsEarlier = false
+/** When a drawing of the pane last set the writing of updates going: a pane brought to the front has no other event. */
+let nudgedAt = 0
+/**
+ * Nobody is at this session: it was started to run one prompt and print the answer (`claude -p`, a script, another
+ * tool's call). It has no pane to show and may be one of hundreds, so nothing of it is noted, kept or put to a
+ * model. Picked up again by a person, it is read back from its transcript like any session that ran without the mod.
+ */
+let isUnwatched = false
+let isWatchSettled = false
+
+/**
+ * Whether somebody is at this session. The session's start says so; an event
+ * that comes before it settles the same by whether the session draws anywhere.
+ */
+const watched = async ($: Dollar): Promise<boolean> => {
+  if (!isWatchSettled) {
+    isWatchSettled = true
+    const surfaces = await $.session.surfaces().catch(() => null)
+    if (surfaces !== null && surfaces.length === 0) isUnwatched = true
+  }
+  return !isUnwatched
+}
 let isCaptioning = false
 
 /** Questions the person has answered in the pane: a second press before the pane is drawn again sends nothing more. */
@@ -175,7 +193,6 @@ const fault = ($: Dollar, where: string, error: unknown) => {
 /** Why a call on the engine did not do what was asked: what it answered, or what it threw. */
 const whyNot = (error: unknown) => (error instanceof Error ? error.message : String(error)).slice(0, 120)
 
-const safeName = (id: string) => id.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 120)
 
 const save = async ($: Dollar, now: number) => {
   if (!sid || !dir) return
@@ -212,17 +229,6 @@ const tell = async ($: Dollar, text: string) => {
 }
 
 /**
- * Whether the person has turned the mod's model calls off (`/trail off`), on
- * this machine and in every session: the steps are still noted, which costs
- * nothing, but no update is written and no picture captioned until `/trail on`.
- */
-const isOff = ($: Dollar): Promise<boolean> =>
-  $.store.get('off').then(
-    value => value === true,
-    () => false,
-  )
-
-/**
  * Puts a stretch of steps to a model and resolves its reply, or null when no
  * model gave one. The first model to answer is the one asked from then on.
  */
@@ -247,18 +253,24 @@ const complete = async ($: Dollar, prompt: string): Promise<string | null> => {
 }
 
 /**
- * Writes the updates for the steps that are ready for them: the newest first, then the
- * history behind it, one model call at a time and never from inside a hook
- * the conversation is waiting on. Resolves how long to wait before the next.
+ * Writes the updates for the steps that are ready for them, one model call at
+ * a time and never from inside a hook the conversation is waiting on, and only
+ * while the pane is showing: a closed pane costs nothing. Opened, it writes
+ * the latest of what went untold; the history behind that waits until the
+ * person asks for it. Resolves how long to wait before the next.
  */
 const digest = async ($: Dollar): Promise<number | null> => {
   if (isDigesting || isRebuilding || !sid) return null
-  if (await isOff($)) {
-    await tell($, OFF)
-    return null
-  }
+  // The pane is the switch: nothing is asked of a model unless the person has the feed in front of them.
+  if (!(await isPaneShown($))) return null
   const job = nextJob(live, skipped)
   if (!job) {
+    wantsEarlier = false
+    await tell($, '')
+    return null
+  }
+  // What went untold while the pane was closed is history once the latest is told: written only when asked for.
+  if (job.prompt && !job.isLatest && !wantsEarlier) {
     await tell($, '')
     return null
   }
@@ -267,6 +279,7 @@ const digest = async ($: Dollar): Promise<number | null> => {
   try {
     let beats: Beat[] = []
     let cleared: string[] = []
+    let captions: { id: string; text: string }[] = []
     if (job.prompt) {
       await tell($, 'writing the latest update…')
       const reply = await complete($, job.prompt)
@@ -276,15 +289,17 @@ const digest = async ($: Dollar): Promise<number | null> => {
         await tell($, 'updates are waiting on a model')
         return DIGEST_RETRY_MS
       }
-      beats = parseBeats(reply, job)
+      // A pull request named by number gets its link, where the session's repository says where that is.
+      beats = withPullLinks(parseBeats(reply, job), await remoteOf($))
       cleared = parseCleared(reply, job)
+      captions = parsePictures(reply, job)
       if (beats.length === 0) {
         for (const id of job.ids) skipped.add(id)
         jot(diag.digests, `unreadable reply: ${reply.slice(0, 160)}`)
         return DIGEST_NEXT_MS
       }
     }
-    live = feedIn(live, job, beats, cleared)
+    live = await linked($, feedIn(live, job, beats, cleared, captions))
     await push($, true)
     return DIGEST_NEXT_MS
   } catch (error) {
@@ -312,36 +327,44 @@ const digestSoon = ($: Dollar, ms: number) => {
  * transcript, so it is asked only just after a turn has ended, when the
  * provider still has that transcript at hand, and for all the pictures at once.
  */
-const caption = async ($: Dollar) => {
-  if (isCaptioning || isRebuilding || !sid || (await isOff($))) return
+const isPaneShown = ($: Dollar): Promise<boolean> =>
+  $.ui.panes().then(
+    panes => panes.some(pane => pane.id === PANE && pane.isShown),
+    () => false,
+  )
+
+/**
+ * Asks the conversation itself what its pictures show, which is the one call
+ * that sees them and the one that costs: it reads the whole conversation
+ * again. So it is never made unasked: only when the person types
+ * `/trail describe`. Otherwise a picture keeps the caption the update's model
+ * made out from the words around it, which costs next to nothing. Resolves
+ * how many pictures it captioned, or null when it could not ask.
+ */
+const caption = async ($: Dollar): Promise<number | null> => {
+  if (isCaptioning || isRebuilding || !sid) return null
   const job = captionJob(live, at => clock(at, zone))
-  if (!job) return
+  if (!job) return 0
   const of = sid
   isCaptioning = true
   try {
     const reply = await $.model.fork({ prompt: job.prompt })
-    if (of !== sid) return
+    if (of !== sid) return null
     if (!reply.isAnswered) {
       jot(diag.captions, `no answer: ${reply.reason}`)
-      return
+      return null
     }
     const told = parseCaptions(reply.text, job)
     jot(diag.captions, `${told.filter(one => one.text).length} of ${job.shots.length} captioned, cache read ${reply.usage.cache_read_input_tokens}, in ${reply.usage.input_tokens}, out ${reply.usage.output_tokens}`)
     for (const one of told) await record($, now => ({ t: 'caption', id: one.id, at: now, text: one.text }))
     await push($, true)
+    return told.filter(one => one.text).length
   } catch (error) {
     fault($, 'caption', error)
+    return null
   } finally {
     isCaptioning = false
   }
-}
-
-const captionSoon = ($: Dollar) => {
-  captionTimer?.cancel()
-  captionTimer = $.clock.after(CAPTION_MS, () => {
-    captionTimer = null
-    void caption($)
-  })
 }
 
 const load = async ($: Dollar): Promise<Trail | null> => {
@@ -380,7 +403,7 @@ const rebuild = async ($: Dollar, isAsked = false): Promise<string> => {
     else if (of !== sid) why = 'the session changed meanwhile'
     else if (!built) why = 'nothing readable was written'
     else {
-      live = journal.reduce(add, adopt(built, had, isAsked))
+      live = await linked($, journal.reduce(add, adopt(built, had, isAsked)))
       await push($, true)
     }
     jot(diag.rebuilds, why || ran.stdout.trim().slice(0, 300))
@@ -470,16 +493,13 @@ const begin = async ($: Dollar) => {
   const id = await $.session.id()
   dir = `${home}/.claude/trail/${id}`
   zone = await zoneNow($)
-  hasShotsDir = false
   skipped.clear()
   const held = await read($, saved)
   const again = held.v === 5 && held.sid === id ? mended(held.trail) : null
   sid = id
   if (again) {
-    live = again
+    live = await linked($, again)
     digestSoon($, DIGEST_MS)
-    // The module starting again inside a live session comes right after a turn: its pictures can be asked about.
-    if (!live.isOpen) captionSoon($)
     // Told before the mod looked for what waits on the person: its latest is read once more, for that.
     if (!live.sought) $.clock.after(50, () => void rebuild($, true))
     $.clock.after(PRUNE_AFTER_MS, () => void prune($))
@@ -517,83 +537,28 @@ const record = async ($: Dollar, made: (now: number) => TrailEvent | null) => {
     soon($)
     // A turn that has ended, or a running one that has said enough, has a stretch to write an update for.
     if (event.t === 'end' || event.t === 'say') digestSoon($, DIGEST_MS)
-    if (event.t === 'end' && !event.aborted) captionSoon($)
   } catch (error) {
     fault($, 'record', error)
   }
 }
 
-const sizeOf = async ($: Dollar, path: string): Promise<{ w: number; h: number }> => {
-  const ran = await $.process.run([SIPS, '-g', 'pixelWidth', '-g', 'pixelHeight', path], { timeoutMs: 10_000 })
-  const w = /pixelWidth:\s*(\d+)/.exec(ran.stdout)
-  const h = /pixelHeight:\s*(\d+)/.exec(ran.stdout)
-  return { w: w ? Number(w[1]) : 0, h: h ? Number(h[1]) : 0 }
-}
-
 /**
- * Keeps a picture for the trail: a small PNG of the mod's own to draw in the
- * pane, safe from whatever later overwrites the original. The whole picture
- * is not copied when it is a file on disk (copies were most of what the mod
- * kept): the file is opened where it lies, for as long as it is still the
- * picture that was kept. One that is passing (bytes that never were a file)
- * is copied whole, there being nowhere else to open it from. Host commands
- * make these, since a mod writes only text. Resolves null for a picture that
- * could not be read.
+ * Notes a picture or a file for the trail: where it lies, and when it was last
+ * written, so it is opened only while it is still the thing that was noted.
+ * Nothing is copied and nothing is drawn: the pane tells of it in words, and
+ * the person opens the file itself. One that never was a file (a picture the
+ * person pasted, a browser's screenshot) is told of and has nothing to open.
  */
-const keep = async ($: Dollar, id: string, source: string, suffix: string, isPassing = false): Promise<Shot | null> => {
-  await ready($)
-  if (!source.startsWith('/')) return null
-  if (!hasShotsDir) {
-    await $.fs.write(`${dir}/shots/.keep`, '')
-    hasShotsDir = true
-  }
-  const name = safeName(id)
-  const out = `${dir}/shots/${name}.png`
-  const ran = await $.process.run([SIPS, '-s', 'format', 'png', '-Z', THUMB_PX, source, '--out', out], { timeoutMs: 15_000 })
-  // sips answers 0 for a file it could not open and writes nothing: the picture is kept only if it is there.
-  if (ran.exitCode !== 0 || !(await $.fs.exists(out))) {
-    jot(diag.shots, `${id} not kept: ${(ran.stderr || ran.stdout).trim().slice(0, 120)}`)
-    return null
-  }
-  const { w, h } = await sizeOf($, out)
-  jot(diag.shots, `${id} ${w}x${h}`)
-  if (isPassing) {
-    const full = `${dir}/shots/${name}.full${suffix}`
-    const copied = await $.process.run([CP, source, full], { timeoutMs: 15_000 })
-    return copied.exitCode === 0 ? { file: out, w, h, full } : { file: out, w, h }
-  }
-  const lies = await $.fs.stat(source).catch(() => null)
-  return lies?.kind === 'file' ? { file: out, w, h, full: source, stamp: Math.round(lies.mtimeMs) } : { file: out, w, h }
-}
-
-/**
- * Keeps what there is to see of a file that is no picture: the preview the
- * system makes of a video or a document, as the pane's small PNG. The file
- * itself is not copied (a video is large): it is opened where it lies.
- */
-const keepPreview = async ($: Dollar, id: string, source: string, type: OutputType): Promise<Shot> => {
-  await ready($)
-  const none: Shot = { file: '', w: 0, h: 0, full: source, type }
+const locate = async ($: Dollar, source: string, type?: OutputType): Promise<Shot> => {
+  const none: Shot = { file: '', w: 0, h: 0, ...(type ? { type } : {}) }
   if (!source.startsWith('/')) return none
-  try {
-    const into = `${dir}/shots/ql-${safeName(id)}`
-    await $.fs.write(`${into}/.keep`, '')
-    hasShotsDir = true
-    await $.process.run([QLMANAGE, '-t', '-s', THUMB_PX, '-o', into, source], { timeoutMs: 20_000 })
-    const out = `${into}/${basename(source)}.png`
-    if (!(await $.fs.exists(out))) return none
-    const { w, h } = await sizeOf($, out)
-    jot(diag.shots, `${id} ${type} ${w}x${h}`)
-    return { ...none, file: out, w, h }
-  } catch (error) {
-    fault($, 'keepPreview', error)
-    return none
-  }
+  const lies = await $.fs.stat(source).catch(() => null)
+  return lies?.kind === 'file' ? { ...none, full: source, stamp: Math.round(lies.mtimeMs) } : none
 }
 
 /** Something the work produced that is no picture: a video, a file handed over, a page published. Set in the trail where it happened. */
 const output = async ($: Dollar, id: string, shot: Shot, label: string, anchor: string, note?: string) => {
-  await record($, now => ({ t: 'shot', id, at: now, anchor, file: shot.file, w: shot.w, h: shot.h, label, ...(shot.full ? { full: shot.full } : {}), ...(shot.type ? { type: shot.type } : {}), ...(note ? { note } : {}) }))
+  await record($, now => ({ t: 'shot', id, at: now, anchor, file: shot.file, w: shot.w, h: shot.h, label, ...(shot.full ? { full: shot.full } : {}), ...(shot.stamp !== undefined ? { stamp: shot.stamp } : {}), ...(shot.type ? { type: shot.type } : {}), ...(note ? { note } : {}) }))
 }
 
 /**
@@ -614,41 +579,29 @@ const heedVideos = async ($: Dollar, id: string, text: string, since: number) =>
       if (!made || made.kind !== 'file' || made.size === 0 || made.mtimeMs < since - 2000) continue
       const key = `out:${tag(path)}:${Math.round(made.mtimeMs)}`
       if (live.items.some(item => item.id === `${key}:shot`)) continue
-      await output($, key, await keepPreview($, key, path, 'video'), basename(path), id)
+      await output($, key, await locate($, path, 'video'), basename(path), id)
     }
   } catch (error) {
     fault($, 'heedVideos', error)
   }
 }
 
-const suffixOf = (path: string) => (/\.(png|jpe?g|gif|webp)$/i.exec(path)?.[0] ?? '.png').toLowerCase()
-
-/** A picture the model looked at or sent: kept, and set in the trail where it happened. Resolves whether it was. */
-const shoot = async ($: Dollar, id: string, source: string, label: string, anchor: string, suffix: string, from?: Source, note?: string, isPassing = false): Promise<boolean> => {
+/** A picture the model looked at or sent, set in the trail where it happened. Resolves whether the file was there. */
+const shoot = async ($: Dollar, id: string, source: string, label: string, anchor: string, from?: Source, note?: string): Promise<boolean> => {
   try {
-    const shot = await keep($, id, source, suffix, isPassing)
-    if (shot) await record($, now => ({ t: 'shot', id, at: now, anchor, file: shot.file, w: shot.w, h: shot.h, label, ...(shot.full ? { full: shot.full } : {}), ...(shot.stamp !== undefined ? { stamp: shot.stamp } : {}), ...(from ? { from } : {}), ...(note ? { note } : {}) }))
-    return shot !== null
+    const shot = await locate($, source)
+    if (!shot.full) return false
+    await record($, now => ({ t: 'shot', id, at: now, anchor, file: '', w: 0, h: 0, label, full: shot.full!, ...(shot.stamp !== undefined ? { stamp: shot.stamp } : {}), ...(from ? { from } : {}), ...(note ? { note } : {}) }))
+    return true
   } catch (error) {
     fault($, 'shoot', error)
     return false
   }
 }
 
-/** The same for a picture that never was a file: a browser's screenshot, one the person pasted. */
-const shootInline = async ($: Dollar, id: string, held: Held, label: string, anchor: string, from?: Source) => {
-  try {
-    await ready($)
-    const text = `${dir}/shots/${safeName(id)}.b64`
-    const bytes = `${dir}/shots/${safeName(id)}.bin`
-    await $.fs.write(text, held.data)
-    hasShotsDir = true
-    const ran = await $.process.run([BASE64, '-D', '-i', text, '-o', bytes], { timeoutMs: 15_000 })
-    if (ran.exitCode === 0) await shoot($, id, bytes, label, anchor, suffixOf(`.${held.type.split('/')[1] ?? 'png'}`), from, undefined, true)
-    await $.process.run([RM, '-f', text, bytes], { timeoutMs: 5000 })
-  } catch (error) {
-    fault($, 'shootInline', error)
-  }
+/** The same for a picture that never was a file: a browser's screenshot, one the person pasted. It is told of, with nothing to open. */
+const shootInline = async ($: Dollar, id: string, label: string, anchor: string, from?: Source) => {
+  await record($, now => ({ t: 'shot', id, at: now, anchor, file: '', w: 0, h: 0, label, ...(from ? { from } : {}) }))
 }
 
 const textsOf = (message: Message): string[] =>
@@ -695,7 +648,7 @@ const heed = async ($: Dollar, door: string, uuid: string, message: Message, ori
     if (/<command-name>\s*\/?trail\s*</.test(text)) return
     await record($, now => ({ t: 'prompt', id: uuid, at: now, text, isCommand: door === 'command' }))
     let index = 0
-    for (const held of imagesOf(message.content)) await shootInline($, `${uuid}:${index++}`, held, 'You pasted a picture', uuid, 'person')
+    for (const _ of imagesOf(message.content)) await shootInline($, `${uuid}:${index++}`, 'You pasted a picture', uuid, 'person')
   } catch (error) {
     fault($, 'heed', error)
   }
@@ -710,7 +663,7 @@ const heedPictures = async ($: Dollar, message: Message, tool: string) => {
       const inside = block['content']
       if (block.type !== 'tool_result' || typeof id !== 'string' || !Array.isArray(inside)) continue
       const held = imagesOf(inside as Block[]).at(-1)
-      if (held) await shootInline($, id, held, `Picture from ${short}`, id)
+      if (held) await shootInline($, id, `Picture from ${short}`, id)
     }
   } catch (error) {
     fault($, 'heedPictures', error)
@@ -734,9 +687,9 @@ const heedResult = async ($: Dollar, id: string, tool: string, input: Record<str
         () => 0,
       )
       const from = isEarlier(written, live.items[0]?.at ?? 0) ? ('earlier' as const) : undefined
-      const isKept = await shoot($, id, file, basename(file), id, suffixOf(file), from)
+      const isKept = await shoot($, id, file, basename(file), id, from)
       const data = result.file?.base64
-      if (!isKept && typeof data === 'string' && data) await shootInline($, id, { data, type: typeof result.file?.type === 'string' ? result.file.type : 'image/png' }, basename(file), id, from)
+      if (!isKept && typeof data === 'string' && data) await shootInline($, id, basename(file), id, from)
     }
     if (tool === 'SendUserFile' && Array.isArray(result.attachments)) {
       const said = typeof input['caption'] === 'string' ? input['caption'] : undefined
@@ -747,8 +700,8 @@ const heedResult = async ($: Dollar, id: string, tool: string, input: Record<str
           const label = SENT + basename(sent.path)
           // Whatever was handed over is an output: a picture is kept as one, anything else by its preview. What
           // Claude said of it as it sent it is its caption, there at once.
-          if (sent.isImage === true) await shoot($, key, sent.path, label, id, suffixOf(sent.path), undefined, said)
-          else await output($, key, await keepPreview($, key, sent.path, outputType(sent.path) === 'video' ? 'video' : 'file'), label, id, said)
+          if (sent.isImage === true) await shoot($, key, sent.path, label, id, undefined, said)
+          else await output($, key, await locate($, sent.path, outputType(sent.path) === 'video' ? 'video' : 'file'), label, id, said)
         }
         index++
       }
@@ -780,8 +733,9 @@ const paneToTop = async ($: Dollar) => {
  * a question nobody sees is no question.
  */
 const post = async ($: Dollar, id: string, text: string, options: string[], image: string): Promise<string> => {
-  let shot: Shot | null = null
-  if (image) shot = await keep($, `q-${id}`, image, suffixOf(image)).catch(() => null)
+  // The picture a question is about is not drawn: the question has the way to open it.
+  const found = image ? await locate($, image).catch(() => null) : null
+  const shot: Shot | null = found?.full ? found : null
   await record($, now => ({ t: 'question', id, at: now, text, options, ...(shot ? { shot } : {}) }))
   await push($, true)
   jot(diag.questions, `asked ${id}${image ? (shot ? ' with a picture' : ' (picture unreadable)') : ''}`)
@@ -798,7 +752,7 @@ const post = async ($: Dollar, id: string, text: string, options: string[], imag
   } catch (error) {
     fault($, 'post', error)
   }
-  const pictured = image && !shot ? ' The picture could not be read, so the question shows without it.' : ''
+  const pictured = image && !shot ? ' The picture could not be found, so the question shows without it.' : ''
   return `The question is in the person's Trail pane.${pictured} Their answer will arrive as their next message: end your turn if you cannot go on without it.`
 }
 
@@ -818,6 +772,45 @@ const answer = async ($: Dollar, question: Question, text: string) => {
     fault($, 'answer', error)
   }
 }
+
+/** The session's repository's remote, asked once: '' when it has none. */
+let remote: string | undefined
+const remoteOf = async ($: Dollar): Promise<string> => {
+  remote ??= await $.session.repo().then(
+    repo => repo?.remote ?? '',
+    () => '',
+  )
+  return remote
+}
+
+/** A trail whose things waiting that name pull requests by number have the link to each: one waiting since before the mod gave links gains them. */
+const linked = async ($: Dollar, trail: Trail): Promise<Trail> => {
+  const feed = withPullLinks(trail.feed, await remoteOf($))
+  return feed.some((beat, index) => beat !== trail.feed[index]) ? { ...trail, feed } : trail
+}
+
+/** Puts a command a thing waiting names on the clipboard. It is never run from the pane: the person runs it, where and when they choose. */
+const copyRef = async ($: Dollar, text: string) => {
+  try {
+    const copied = await $.ui.copy({ text })
+    $.ui.toast(copied.isCopied ? 'Copied.' : `Could not copy: ${copied.reason}`)
+  } catch (error) {
+    fault($, 'copyRef', error)
+  }
+}
+
+/** Opens a link a thing waiting names, in the person's browser. */
+const openLink = async ($: Dollar, url: string) => {
+  try {
+    if (!isLink(url)) return
+    const ran = await $.process.run([OPEN, url], { timeoutMs: 10_000 })
+    if (ran.exitCode !== 0) $.ui.toast(`Trail could not open it: ${ran.stderr.trim().slice(0, 80)}`)
+  } catch (error) {
+    fault($, 'openLink', error)
+  }
+}
+
+const isLink = (ref: string): boolean => /^https?:\/\/\S+$/.test(ref)
 
 /** The person says a thing the work left for them is done: it stops waiting. */
 const settle = async ($: Dollar, id: string) => {
@@ -851,6 +844,13 @@ const jump = async ($: Dollar, target: Target) => {
   }
 }
 
+/** The person asks for the updates of what happened while the pane was closed, further back than the latest. */
+const writeEarlier = async ($: Dollar) => {
+  wantsEarlier = true
+  await tell($, 'writing the earlier updates…')
+  digestSoon($, 50)
+}
+
 /** Shows all an entry has to say, or goes back to its first rows when it is the one shown whole. */
 const unfold = async ($: Dollar, target: Target) => {
   try {
@@ -865,8 +865,13 @@ const unfold = async ($: Dollar, target: Target) => {
  * lies, or the small copy the mod kept when a picture's file is gone or has
  * been written over since (the same name now holds another picture).
  */
-const openPicture = async ($: Dollar, shot: Shot) => {
+const openPicture = async ($: Dollar, shot: Shot, id?: string) => {
   try {
+    // Opened from the pane, an output is read from then on, whatever comes of opening it.
+    if (id) {
+      await record($, now => ({ t: 'opened', id, at: now }))
+      await push($, true)
+    }
     let path = shot.full || shot.file
     if (shot.full && shot.type !== 'link') {
       const lies = await $.fs.stat(shot.full).catch(() => null)
@@ -901,21 +906,17 @@ const turnPage = async ($: Dollar, by: number) => {
 const ASKING: Mode = 'questions'
 
 const EMPTY_VIEW: Record<Mode, string> = {
-  sent: 'Nothing sent to you yet. Each file Claude sends you, and each page it publishes, shows here to open.',
   questions: 'Nothing is waiting on you.',
   feed: 'Nothing yet. The feed fills in as the conversation goes.',
-  done: 'No big task finished yet. One is listed here when a whole piece of work is done.',
-  outputs: 'Nothing made yet. What Claude produces shows here: screenshots of its work, videos, files it sends you, pages it publishes.',
-  steps: 'Nothing yet. Each step shows here as it happens.',
+  outputs: 'Nothing made yet. What Claude produces shows here by name, to open: screenshots of its work, videos, files it sends you, pages it publishes. What you have not opened yet is in bold.',
+  steps: 'Nothing yet. Each thing you ask shows here.',
 }
 
 /** The views, as the tabs name them. No hotkeys: their letters beside each name were more to read than the names. */
 const TABS: readonly { mode: Mode; label: string }[] = [
   { mode: 'feed', label: 'highlights' },
-  { mode: 'sent', label: 'sent' },
-  { mode: 'done', label: 'done' },
   { mode: 'outputs', label: 'outputs' },
-  { mode: 'steps', label: 'every step' },
+  { mode: 'steps', label: 'every prompt' },
 ]
 
 const switchMode = async ($: Dollar, to: Mode) => {
@@ -931,10 +932,13 @@ const switchMode = async ($: Dollar, to: Mode) => {
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
+    isUnwatched = e.isInteractive === false
+    isWatchSettled = true
+    if (isUnwatched) return next(e)
     await $.command.register({
       name: 'trail',
       description: 'Show what this conversation did as a feed in a side pane; click a line to jump there',
-      argumentHint: '[close|off|on|rebuild|where]',
+      argumentHint: '[close|describe|rebuild|where]',
       immediate: true,
     })
     await $.tool.register({ name: 'ask', description: ASK_DESCRIPTION, inputSchema: ASK_SCHEMA })
@@ -960,17 +964,10 @@ export const register: Register = on => {
       return { text: 'Trail closed.' }
     }
     if (verb === 'where') return { text: `Trail keeps this session in ${dir}${await keptSize($)}` }
-    if (verb === 'off') {
-      await $.store.set('off', true)
-      await tell($, OFF)
-      return { text: 'Trail is off in every session: it still notes each step, which costs nothing, but writes no updates and asks no model. /trail on turns it back on.' }
-    }
-    if (verb === 'on') {
-      await $.store.set('off', false)
-      await tell($, '')
-      digestSoon($, 50)
-      if (!live.isOpen) captionSoon($)
-      return { text: 'Trail is on: updates are being written for what happened meanwhile.' }
+    if (verb === 'describe') {
+      // The person asks for it, knowing what it costs: the conversation reads itself again to say what its pictures show.
+      const count = await caption($)
+      return { text: count === null ? 'Trail could not ask the conversation about its pictures just now. Try again once it is at rest.' : count === 0 ? 'Every recent picture already has a caption from the conversation itself.' : `Trail asked the conversation what its pictures show: ${count} captioned.` }
     }
     if (verb === 'rebuild') {
       const why = await rebuild($, true)
@@ -982,19 +979,21 @@ export const register: Register = on => {
     const opened = await openPane($)
     if (!opened.isPlaced) return { text: `Trail is open but not shown: ${opened.reason}` }
     await paneToTop($)
+    // Opened, the feed catches up on the latest of what happened while it was closed.
+    digestSoon($, 50)
 
     return { text: verb === 'rebuild' ? `Trail rebuilt from the transcript: ${live.items.length} steps.` : OPENED }
   })
 
   on('session.append', { door: ['prompt', 'command', 'response', 'delivery', 'compaction', 'notice'] }, async ($, e, next) => {
     // The row is the session's to store: it is read on its way there and passed on as it came.
-    if (e.agentId === undefined) await heed($, e.door, e.uuid, e.message, e.origin.kind)
+    if (e.agentId === undefined && (await watched($))) await heed($, e.door, e.uuid, e.message, e.origin.kind)
 
     return next(e)
   })
 
   on('session.append', { door: 'tool-result', origin: { kind: 'tool', tool: /^mcp__/ } }, async ($, e, next) => {
-    if (e.agentId === undefined) await heedPictures($, e.message, e.origin.kind === 'tool' ? e.origin.tool : '')
+    if (e.agentId === undefined && (await watched($))) await heedPictures($, e.message, e.origin.kind === 'tool' ? e.origin.tool : '')
 
     return next(e)
   })
@@ -1014,7 +1013,7 @@ export const register: Register = on => {
   })
 
   on('tool.call', async ($, e, next) => {
-    if (e.agentId !== undefined) return next(e)
+    if (e.agentId !== undefined || !(await watched($))) return next(e)
     const id = e.tool_use_id
     const tool = String(e.tool)
     const input = e as unknown as Record<string, unknown>
@@ -1028,7 +1027,7 @@ export const register: Register = on => {
   })
 
   on('turn.complete', async ($, e, next) => {
-    if (e.agentId === undefined) {
+    if (e.agentId === undefined && (await watched($))) {
       // A turn the person stopped, or that broke, did not come out as what was last said.
       const isCut = e.isAborted || e.reason !== 'answer'
       await record($, now => ({ t: 'end', at: now, ...(isCut ? { aborted: true } : {}) }))
@@ -1040,6 +1039,7 @@ export const register: Register = on => {
   })
 
   on('session.end', async ($, e, next) => {
+    if (!(await watched($))) return next(e)
     await push($, true)
     if (e.reason === 'clear' || e.reason === 'resume') {
       // The process goes on under another session id, and no session.start follows: the next row begins its trail.
@@ -1053,6 +1053,7 @@ export const register: Register = on => {
 
   // The engine's word that the process now runs under a session: after /resume or /clear no session.start says so.
   on('classic.SessionStart', async ($, e, next) => {
+    if (!(await watched($))) return next(e)
     try {
       if (sid && e.session_id !== sid) {
         sid = ''
@@ -1087,15 +1088,21 @@ export const register: Register = on => {
     const kind = await read($, mode)
     const trail = mended(kept.trail) ?? emptyTrail()
     const waiting = waitingCount(trail)
+    // A pane brought to the front is drawn, and that is all the mod hears of it: the drawing sets the updates going.
+    if (!digestTimer && !isDigesting && Date.now() - nudgedAt > NUDGE_MS) {
+      nudgedAt = Date.now()
+      digestSoon($, 300)
+    }
     // The tab for what waits on the person is there only while something does; with nothing left, the pane is back at the feed.
     const tabs = waiting > 0 ? [{ mode: ASKING, label: `${waiting} waiting on you` }, ...TABS] : TABS
     const listing: Mode = tabs.some(tab => tab.mode === kind) ? kind : 'feed'
+    // Steps from while the pane was closed, further back than the latest, are summarised only when asked for.
+    const untold = listing === 'feed' && !wantsEarlier ? backlogOf(trail) : 0
     const doing = await read($, status)
     // A cell of margin each side keeps the words off the pane's frame.
     const width = Math.max(18, Math.min(200, e.props.bodyColumns) - 2 * MARGIN)
     const { rows, earlier, later, foot } = layout(trail, { width, picked: pick, page: back, mode: listing, zone })
     const { Box, Button, Text } = $.ui.resolve(e)
-    const Image = e.surface === 'terminal' ? $.ui.resolve(e).Image : null
     const Input = e.surface === 'mobile' ? null : $.ui.resolve(e).Input
 
     return (
@@ -1128,20 +1135,12 @@ export const register: Register = on => {
                 </Text>
               )
             }
-            if (row.kind === 'head') {
-              return (
-                <Text bold wrap="truncate-end">
-                  {`${row.text} ${'─'.repeat(Math.max(0, width - row.text.length - 1))}`}
-                </Text>
-              )
-            }
             if (row.kind === 'question') {
-              const { question, picture } = row
+              const { question } = row
               const whole = question.shot && (question.shot.full || question.shot.file) ? question.shot : undefined
               return (
                 <Box key={`row:${row.key}`} flexDirection="column" rowGap={1}>
                   <Text dimColor wrap="truncate-end">{`Claude is asking you · ${row.time}`}</Text>
-                  {picture && Image && <Image source={{ file: picture.file, format: 'png' }} columns={picture.columns} rows={picture.rows} alt={picture.alt} />}
                   <Box flexDirection="column">
                     {row.lines.map(text => (
                       <Text bold wrap="truncate-end">
@@ -1164,7 +1163,7 @@ export const register: Register = on => {
                 </Box>
               )
             }
-            const { target, open, picture, settles } = row
+            const { target, open, settles, refs } = row
             const isAsk = row.tone === 'ask'
             const isQuiet = row.tone === 'quiet'
             const pad = ' '.repeat(row.pad)
@@ -1172,7 +1171,7 @@ export const register: Register = on => {
               <Box key={`row:${row.key}`} flexDirection="column">
                 <Box flexDirection="row" columnGap={2}>
                   <Text dimColor>{row.time}</Text>
-                  {open && <Button key={`open:${row.key}`} plain dimColor label="[open]" onPress={() => void openPicture($, open)} />}
+                  {open && <Button key={`open:${row.key}`} plain dimColor label="[open]" onPress={() => void openPicture($, open, row.key)} />}
                   {row.hasMore && <Button key={`more:${row.key}`} plain dimColor label={row.isOpen ? '[less]' : '[more]'} onPress={() => void unfold($, target)} />}
                   {settles && <Button key={`settle:${row.key}`} plain dimColor label="[done]" onPress={() => void settle($, settles)} />}
                   <Box display="none" hover={{ display: 'flex' }}>
@@ -1189,21 +1188,34 @@ export const register: Register = on => {
                     {index === 0 && row.pad > 0 ? `${row.glyph} ${text}` : pad + text}
                   </Text>
                 ))}
+                {refs?.map((ref, index) => (
+                  <Box key={`ref:${row.key}:${index}`} flexDirection="row" columnGap={1}>
+                    <Text>{pad}</Text>
+                    {isLink(ref) ? (
+                      <Button key={`link:${row.key}:${index}`} plain dimColor label="[open]" onPress={() => void openLink($, ref)} />
+                    ) : (
+                      <Button key={`copy:${row.key}:${index}`} plain dimColor label="[copy]" onPress={() => void copyRef($, ref)} />
+                    )}
+                    <Text dimColor wrap="truncate-end">
+                      {ref}
+                    </Text>
+                  </Box>
+                ))}
                 {row.work !== '' && (
                   <Text dimColor wrap="truncate-end">
                     {`${pad}└ ${row.work}`}
                   </Text>
                 )}
-                {picture && Image && (
-                  <Box flexDirection="row" marginTop={1}>
-                    <Text>{pad}</Text>
-                    <Image source={{ file: picture.file, format: 'png' }} columns={picture.columns} rows={picture.rows} alt={picture.alt} />
-                  </Box>
-                )}
               </Box>
             )
           })}
         </Box>
+        {untold > 0 && (
+          <Box flexDirection="row" columnGap={2} marginTop={1}>
+            <Text dimColor>{`${untold} earlier ${untold === 1 ? 'step has' : 'steps have'} no summary`}</Text>
+            <Button key="write-earlier" plain dimColor label="[summarise]" onPress={() => void writeEarlier($)} />
+          </Box>
+        )}
         {earlier > 0 && (
           <Box flexDirection="row" columnGap={2} marginTop={1}>
             <Button key="earlier" plain dimColor label={`[${earlier} earlier]`} onPress={() => void turnPage($, 1)} />

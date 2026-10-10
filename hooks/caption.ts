@@ -51,13 +51,14 @@ const described = (shot: Item, trail: Trail, time: (at: number) => string): stri
 }
 
 /**
- * The pictures still without a caption, as a question for the conversation:
+ * The pictures still without a caption of the conversation's own (none at
+ * all, or one only made out from the words around it), as a question for it:
  * only those since the context was last compacted, which are the ones it
  * still holds. Null when there are none.
  */
 export const captionJob = (trail: Trail, time: (at: number) => string): CaptionJob | null => {
   const since = trail.items.map(item => item.kind).lastIndexOf('compact')
-  const shots = trail.items.filter((item, index) => index > since && item.kind === 'shot' && item.shot !== undefined && item.shot.note === undefined).slice(-MOST)
+  const shots = trail.items.filter((item, index) => index > since && item.kind === 'shot' && item.shot !== undefined && (item.shot.note === undefined || item.shot.guess === true)).slice(-MOST)
   if (shots.length === 0) return null
   const lines = shots.map((shot, index) => `${index + 1}. ${described(shot, trail, time)}`)
   return { shots, prompt: [...INTRO, ...lines, ...OUTRO].join('\n') }

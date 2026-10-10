@@ -2,12 +2,11 @@
 // Pure, so a test or the preview tool can read a page without a terminal.
 
 import type { Beat, Item, ItemKind, Mode, OutputType, Picked, Question, Shot, Trail } from '../types'
-import { clip, isOwnOutput, isSent, SENT, waitingCount, waitsOf, workCount, workLine } from './trail.ts'
+import { clip, isOwnOutput, waitingCount, workCount, workLine } from './trail.ts'
 
 /** What a press on a line jumps to: the transcript row it stands for, and a tool call beside it. */
 export type Target = { id: string; anchor: string; alt?: string; kind: string }
 
-export type Picture = { file: string; columns: number; rows: number; alt: string }
 
 /**
  * One entry of the pane, whatever the view. Every entry is drawn the same
@@ -38,16 +37,10 @@ export type Row =
       tone: 'ask' | 'plain' | 'quiet'
       /** An output's entry: the thing itself, for `[open]`. */
       open?: Shot
-      /** An output's entry: its picture, when it is one of those drawn. */
-      picture?: Picture
       /** A thing the work left for the person to do: what `[done]` stops waiting. */
       settles?: string
-    }
-  | {
-      /** The name of a part of the page set apart from the rest: what waits on the person, above the feed. */
-      kind: 'head'
-      key: string
-      text: string
+      /** And what they need to do it with: links to open and commands to copy. */
+      refs?: string[]
     }
   | {
       kind: 'question'
@@ -56,7 +49,6 @@ export type Row =
       time: string
       /** The question, wrapped. */
       lines: string[]
-      picture?: Picture
     }
 
 export type Page = {
@@ -79,26 +71,19 @@ export type Look = {
 /** Lines to a page, and how far a page back moves: pages overlap so a place is not lost. */
 export const PAGE_LINES = 120
 export const PAGE_STEP = 80
-/** Outputs to a page of the outputs view: each is drawn, so far fewer. */
-export const PAGE_OUTPUTS = 12
-/** Pictures drawn at once; the rest are a line each until pressed. */
-const PICTURES = 6
-/** A terminal cell is about twice as tall as it is wide. */
-const CELL_ASPECT = 0.5
-const PICTURE_ROWS = 14
-const PICTURE_COLUMNS = 64
 /** Cells an entry's mark takes before its words, and that the rows under the first are set in by. */
 const MARK = 2
 /** The widest a line of text is set, in cells: wider is tiring to read. */
 const MEASURE = 72
-/** How the part of the feed that holds what waits on the person is named. */
-export const WAITING_ON_YOU = 'Waiting on you'
 const NOBODYS = /^(Background task\b|Carried on without a new prompt$)/
 
 const GLYPH: Record<ItemKind, string> = { ask: '❯', step: '•', done: '✓', shot: '▣', recap: '≡', compact: '~' }
 /** Lines of a request or a step shown once it is opened, and of an update always: an update is there to be read whole. */
 const DETAIL_OPEN = 12
 const UPDATE_LINES = 12
+/** Rows one action of an update may take, and the longest an update made of actions is when it is one line of text. */
+const ACTION_LINES = 3
+const ACTION_WIDEST = 110
 const CAPTION_LINES = 6
 const OUTPUT_GLYPH: Record<OutputType, string> = { image: '▣', video: '▶', file: '▤', link: '↗' }
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
@@ -213,45 +198,21 @@ export const zoneOf = (text: string): number | undefined => {
   return (found[1] === '-' ? -1 : 1) * (Number(found[2]) * 60 + Number(found[3]))
 }
 
-/** The box of cells a picture of that shape is drawn in: as wide as there is room, never taller than a glance. */
-export const pictureBox = (w: number, h: number, room: number): { columns: number; rows: number } => {
-  const tall = w > 0 && h > 0 ? h / w : 0.625
-  let columns = Math.max(8, Math.min(PICTURE_COLUMNS, 255, room))
-  let rows = Math.max(1, Math.round(columns * tall * CELL_ASPECT))
-  if (rows > PICTURE_ROWS) {
-    rows = PICTURE_ROWS
-    columns = Math.max(4, Math.min(columns, Math.round(rows / (tall * CELL_ASPECT))))
-  }
-  return { columns, rows }
-}
-
-const pictureOf = (shot: Shot, room: number, alt: string): Picture => ({ file: shot.file, ...pictureBox(shot.w, shot.h, room), alt: alt || ' ' })
-
-/** Of a run of pictures taken one after another the last is drawn, and only of the newest runs. */
-const drawnPictures = (items: Item[], picked: string): Set<string> => {
-  // A recap or a compaction mark between two pictures does not part them.
-  const told = items.filter(item => item.kind !== 'recap' && item.kind !== 'compact')
-  const lastOfRun: string[] = []
-  told.forEach((item, index) => {
-    if (item.kind === 'shot' && told[index + 1]?.kind !== 'shot') lastOfRun.push(item.id)
-  })
-  const drawn = new Set(lastOfRun.slice(-PICTURES))
-  if (picked) drawn.add(picked)
-  return drawn
-}
-
 const counted = (count: number, one: string, many: string): string => count + ' ' + (count === 1 ? one : many)
 
 const footOf = (trail: Trail, look: Look): string => {
-  const steps = trail.items.filter(item => item.kind === 'step' || item.kind === 'done').length
+  const prompts = trail.items.filter(item => item.kind === 'ask' && !NOBODYS.test(item.line)).length
+  const unopened = (of: Item[]): string => {
+    const left = of.filter(item => item.shot !== undefined && Boolean(item.shot.full || item.shot.file) && !item.shot.opened).length
+    return left > 0 ? ` (${left} not opened)` : ''
+  }
   const outputs = trail.items.filter(item => isOwnOutput(item, trail)).length
   const waiting = waitingCount(trail)
   const told = trail.feed.filter(beat => beat.kind !== 'built' && beat.kind !== 'waiting').length
-  const tasks = trail.feed.filter(beat => beat.kind === 'built').length
   const parts =
     look.mode === 'questions'
       ? []
-      : [look.mode === 'sent' ? trail.items.filter(isSent).length + ' sent to you' : look.mode === 'feed' ? counted(told, 'update', 'updates') : look.mode === 'done' ? counted(tasks, 'big task done', 'big tasks done') : look.mode === 'outputs' ? counted(outputs, 'output', 'outputs') : counted(steps, 'step', 'steps')]
+      : [look.mode === 'feed' ? counted(told, 'update', 'updates') : look.mode === 'outputs' ? counted(outputs, 'output', 'outputs') + unopened(trail.items.filter(item => isOwnOutput(item, trail))) : counted(prompts, 'prompt', 'prompts')]
   if (waiting > 0) parts.push(waiting + ' waiting on you')
   const last = Math.max(trail.lastAt, trail.items.reduce((latest, item) => Math.max(latest, item.at), 0))
   // The day, not how long ago: the pane may sit undrawn for a night, and an age would go stale in it.
@@ -260,7 +221,7 @@ const footOf = (trail: Trail, look: Look): string => {
   return parts.join(' · ')
 }
 
-type Entry = { at: number; rank: number; seq: number; row: (drawn: Set<string>) => Row }
+type Entry = { at: number; rank: number; seq: number; row: () => Row }
 
 /** Rows of an entry's words shown at rest and once opened, by what the entry is. */
 const AT_REST: Record<ItemKind, number> = { ask: 3, step: 2, done: 4, shot: 1, recap: 8, compact: 1 }
@@ -277,43 +238,41 @@ export const layout = (trail: Trail, look: Look): Page => {
   const entries: Entry[] = []
   let seq = 0
 
-  // The feed is the updates and the pictures, and nothing else: what was asked and each step are the other
-  // view's. One line stands in for what no update tells of yet, the latest of it, so a running turn is seen to move.
-  // The outputs are what the work produced, each drawn; the list of things done has no steps at all.
-  const untold = look.mode === 'feed' ? [...trail.items].reverse().find(item => (item.kind === 'step' || item.kind === 'done') && !item.fed) : undefined
+  // The feed is the updates and nothing else: what was done, as it has been told. What was asked, and what the
+  // work produced, are the other views'; a step no update tells of yet is not shown, the line under the tabs saying
+  // that work is going on.
   for (const item of trail.items) {
-    if (look.mode === 'done' || look.mode === 'questions') break
+    if (look.mode === 'questions' || look.mode === 'feed') break
     // The outputs are Claude's: what the session made, sent or published, not what the person showed it.
     if (look.mode === 'outputs' && !isOwnOutput(item, trail)) continue
-    // What Claude sent is a view of its own: the files and pages a conversation says it handed over.
-    if (look.mode === 'sent' && !isSent(item)) continue
-    if (look.mode === 'feed' && item.kind !== 'shot' && item !== untold) continue
+    // The last view is the person's own side of the conversation: each thing they asked, and nothing of what was done about it.
+    if (look.mode === 'steps' && (item.kind !== 'ask' || NOBODYS.test(item.line))) continue
     entries.push({
       at: item.at,
       rank: item.kind === 'ask' ? 0 : 1,
       seq: seq++,
-      row: drawn => {
+      row: () => {
         const opened = isOpen(item.id)
         const isOutput = item.kind === 'shot'
         const room = Math.max(8, width - MARK)
         const took = item.kind === 'ask' && item.ms !== undefined && item.ms >= 60_000 ? '(' + span(item.ms) + ')' : ''
         // Opened, a request or a step shows all that was said; at rest, its first sentence.
         const rest = AT_REST[item.kind] ?? 2
-        // Among the things sent, each is named by its file alone: that it was sent goes without saying there.
-        const name = look.mode === 'sent' && item.line.startsWith(SENT) ? item.line.slice(SENT.length) : item.line
+        const name = item.line
         const atRest = wrap(name, room, rest)
         const whole = wrap(item.more ?? name, room, DETAIL_OPEN)
         const hasMore = whole.length > atRest.length || (item.more !== undefined && item.more.length > item.line.length) || (atRest.at(-1)?.endsWith('…') ?? false)
         const said = tailed(opened ? whole : atRest, took, room)
         // An output is told of too: what it shows and what it was about, under its name.
         const lines = item.shot?.note ? [...said, ...wrap(item.shot.note, room, CAPTION_LINES)] : said
-        const isDrawn = isOutput && item.shot?.file && drawn.has(item.id)
+        // Something to open that the person has not opened yet is new to them; opened, it is read.
+        const canOpen = isOutput && item.shot !== undefined && Boolean(item.shot.full || item.shot.file)
         return {
           kind: 'line',
           key: item.id,
           target: { id: item.id, anchor: item.anchor, kind: item.kind, ...(item.alt ? { alt: item.alt } : {}) },
           time: timeOf(item.at),
-          glyph: item === untold ? '…' : isOutput ? OUTPUT_GLYPH[item.shot?.type ?? 'image'] : (GLYPH[item.kind] ?? '•'),
+          glyph: isOutput ? OUTPUT_GLYPH[item.shot?.type ?? 'image'] : (GLYPH[item.kind] ?? '•'),
           lines,
           pad: MARK,
           hasMore: hasMore && !isOutput,
@@ -322,9 +281,8 @@ export const layout = (trail: Trail, look: Look): Page => {
           work: look.mode === 'steps' && item.work && workCount(item.work) > 0 ? clip(workLine(item.work), Math.max(8, room - 2)) : '',
           note: noteFor(item.id),
           // A request is the person's; work a finished background task set off, or that simply carried on, is nobody's.
-          tone: item === untold ? 'quiet' : item.kind === 'ask' ? (NOBODYS.test(item.line) ? 'quiet' : 'ask') : item.kind === 'recap' || item.kind === 'compact' ? 'quiet' : 'plain',
-          ...(isOutput && item.shot && (item.shot.full || item.shot.file) ? { open: item.shot } : {}),
-          ...(isDrawn ? { picture: pictureOf(item.shot!, room, item.line) } : {}),
+          tone: canOpen ? (item.shot!.opened ? 'quiet' : 'ask') : item.kind === 'ask' ? (NOBODYS.test(item.line) ? 'quiet' : 'ask') : item.kind === 'recap' || item.kind === 'compact' ? 'quiet' : 'plain',
+          ...(canOpen ? { open: item.shot! } : {}),
         }
       },
     })
@@ -333,15 +291,21 @@ export const layout = (trail: Trail, look: Look): Page => {
   const beatRow = (beat: Beat): Row => {
     const isTask = beat.kind === 'built'
     const isWait = beat.kind === 'waiting'
-    // A thing done or to do is a line with its mark; an update is a short piece, read across the whole pane.
+    // A thing to do is a line with its mark. An update is its actions, each a short line of its own with a
+    // mark; one written before updates were actions is a short piece, read across the whole pane.
     const pad = isTask || isWait ? MARK : 0
+    const words = beat.detail ? beat.title + ' ' + beat.detail : beat.title
+    const isActions = !isTask && !isWait && (words.includes('\n') || words.length <= ACTION_WIDEST)
+    const lines = isActions
+      ? words.split('\n').flatMap(action => wrap(action, Math.max(8, width - MARK), ACTION_LINES).map((text, index) => (index === 0 ? '• ' : '  ') + text))
+      : wrap(words, width - pad, UPDATE_LINES)
     return {
       kind: 'line',
       key: beat.id,
       target: { id: beat.id, anchor: beat.anchor, kind: isTask ? 'task' : isWait ? 'wait' : 'update', ...(beat.alt ? { alt: beat.alt } : {}) },
       time: timeOf(beat.at),
       glyph: isTask ? '✓' : isWait ? '○' : ' ',
-      lines: wrap(beat.detail ? beat.title + ' ' + beat.detail : beat.title, width - pad, UPDATE_LINES),
+      lines,
       pad,
       hasMore: false,
       isOpen: false,
@@ -349,14 +313,14 @@ export const layout = (trail: Trail, look: Look): Page => {
       note: noteFor(beat.id),
       tone: isTask || isWait ? 'ask' : 'plain',
       ...(isWait ? { settles: beat.id } : {}),
+      ...(isWait && beat.refs && beat.refs.length > 0 ? { refs: beat.refs } : {}),
     }
   }
-  if (look.mode === 'feed' || look.mode === 'done' || look.mode === 'questions') {
+  if (look.mode === 'feed' || look.mode === 'questions') {
     for (const beat of trail.feed) {
-      // A big task done is one list's and a thing left with the person another's; the feed is the updates.
-      const isTask = beat.kind === 'built'
+      // A thing left with the person has a list of its own; the feed is the updates. (A big task done, which older versions listed, is no longer shown.)
       const isWait = beat.kind === 'waiting'
-      if (isWait ? look.mode !== 'questions' || beat.over !== undefined : isTask !== (look.mode === 'done') || look.mode === 'questions') continue
+      if (isWait ? look.mode !== 'questions' || beat.over !== undefined : beat.kind === 'built' || look.mode === 'questions') continue
       // An update tells of what came before it, pictures included: it sits above them.
       entries.push({ at: beat.at, rank: 3, seq: seq++, row: () => beatRow(beat) })
     }
@@ -396,15 +360,9 @@ export const layout = (trail: Trail, look: Look): Page => {
   entries.reverse()
 
   const total = entries.length
-  const [size, step] = look.mode === 'outputs' || look.mode === 'sent' ? [PAGE_OUTPUTS, PAGE_OUTPUTS] : [PAGE_LINES, PAGE_STEP]
+  const [size, step] = [PAGE_LINES, PAGE_STEP]
   const start = Math.min(Math.max(0, look.page) * step, Math.max(0, total - 1))
   const shown = entries.slice(start, start + size)
-  const times = shown.map(entry => entry.at)
-  const [from, to] = [Math.min(...times), Math.max(...times)]
-  const within = shown.length > 0 ? trail.items.filter(item => item.at >= from && item.at <= to) : []
-  // Among the outputs every one on the page is drawn: seeing them is what the view is for.
-  const drawn = look.mode === 'outputs' || look.mode === 'sent' ? new Set(within.map(item => item.id)) : drawnPictures(within, look.picked.id)
-
   const rows: Row[] = []
   // What waits on the person has a view of its own, there only while something waits: it is to be answered, not read past.
   if (look.mode === 'questions') {
@@ -416,13 +374,9 @@ export const layout = (trail: Trail, look: Look): Page => {
         question,
         time: timeOf(question.at),
         lines: wrap(question.text, width, 8),
-        ...(question.shot?.file ? { picture: pictureOf(question.shot, width, question.text) } : {}),
       })
     }
   }
-  // What waits on the person is the first thing the feed says, above the latest of it: it is why the work stopped.
-  const left = look.mode === 'feed' && start === 0 ? waitsOf(trail).reverse() : []
-  if (left.length > 0) rows.push({ kind: 'head', key: 'head:waiting', text: WAITING_ON_YOU }, ...left.map(beatRow))
   let day = ''
   for (const entry of shown) {
     const today = dayOf(entry.at, look.zone)
@@ -430,7 +384,7 @@ export const layout = (trail: Trail, look: Look): Page => {
       day = today
       rows.push({ kind: 'day', key: 'day:' + entry.seq, text: today })
     }
-    rows.push(entry.row(drawn))
+    rows.push(entry.row())
   }
 
   return { rows, earlier: Math.max(0, total - start - shown.length), later: start, foot: footOf(trail, look) }

@@ -3,7 +3,7 @@
 // the hooks module's; this makes the prompt and reads the answer.
 
 import type { Beat, Item, Trail } from '../types'
-import { clean, clip, MAX_BEATS, waitsOf, workCount, workLine } from './trail.ts'
+import { clean, clip, MAX_BEATS, SENT, waitsOf, workCount, workLine } from './trail.ts'
 
 /** Steps to write updates for. */
 export type Job = {
@@ -19,6 +19,8 @@ export type Job = {
   isLatest: boolean
   /** The things still waiting on the person that the log names, in the order it marks them w1, w2 and so on. */
   open: string[]
+  /** The pictures and files without a caption that the log names, in the order it marks them p1, p2 and so on. */
+  pics: string[]
 }
 
 /** Characters of log put to the model at once. */
@@ -27,42 +29,49 @@ const LOG_MAX = 9000
 const RETOLD_MAX = 6000
 /** Steps to a stretch: each stretch is told in one update, so this is how often a long run is told of. */
 const STRETCH_STEPS = 4
-/** Big tasks one reply may name: more than a few is a list of steps, not of tasks. */
-const TASKS_MOST = 4
 const UPDATE_MAX = 420
-const TASK_MAX = 110
+/** Actions to a stretch, and the length of one: an update is a few short lines, not a paragraph. */
+const ACTIONS_MOST = 3
+const ACTION_MAX = 90
+/** What stands in for an exchange with no work in it: the start of the answer. */
+const ANSWER_SHOWN = 110
 /** Things one reply may leave waiting on the person, the length of each, and how many still waiting are put to the model. */
 const WAITS_MOST = 3
 const WAIT_MAX = 200
 const OPEN_MOST = 8
+/** Commands and links one thing waiting may carry, and the length of one. */
+const REFS_MOST = 4
+const REF_MAX = 240
+/** Pictures one log asks captions for, and the length of a caption. */
+const PICS_MOST = 12
+const CAPTION_MAX = 320
 const STILL_WAITING = 'STILL WAITING ON THE PERSON FROM BEFORE THIS LOG:'
 /** What in an answer with no work in it says something may be left with the person: it is then put to a model like any other. */
-const LEFT_WITH_THEM = /\?|\b(?:waits?|waiting|blocked) on you\b|\bneeds? you(?:r)?\b|\byou(?:'ll| will)? (?:need|have) to\b|\b(?:once|until|after) you\b|\byour (?:call|go-ahead|approval|answer|decision|choice|pick|sign-off)\b|\blet me know\b|\bconfirm\b/i
+const LEFT_WITH_THEM = /\?|\b(?:waits?|waiting|blocked) on you\b|\bneeds? you(?:r)?\b|\byou(?:'ll| will)? (?:need|have) to\b|\b(?:once|until|after) you\b|\byour (?:call|go-ahead|approval|answer|decision|choice|pick|sign-off)\b|\b(?:let|tell) me\b|\bsay which\b|\bup to you\b|\bconfirm\b/i
 
 export const SYSTEM = [
-  'You write the live activity feed of a coding session between a person and Claude, an AI coding agent: short updates, like the running commentary of a match, that let the person follow what happened without reading the conversation.',
+  'You write the activity feed of a coding session between a person and Claude, an AI coding agent: a terse list of what was done, so the person can see what happened at a glance without reading the conversation.',
   '',
   'You are given a log of part of the session: what the person asked, then what Claude said and did, divided into numbered stretches marked [1], [2] and so on.',
-  'Write one update for each stretch: one to three plain sentences, at most forty words, saying what was done in it and what came of it. Short is the point: the person should take each one in at a glance.',
-  'Tell it as it happened, in the past tense, concrete and specific: the name of the thing, the number, the outcome. In the first stretch of a request, begin from what was asked. Where a stretch ends a request, end with how things stand and anything now waiting on the person.',
-  'Write to the person: call them "you" and the agent "Claude".',
-  'Leave out the routine: reading files, re-running commands, what will be done next. No filler, no praise, no headings, no lists.',
-  'Report only what the log shows Claude did, found or asked. What the person asked for is there so you know what the work was for: never report it as done unless the log shows it.',
+  'For each stretch, write the things done in it that matter, as one to three actions. An action is a few words, eight at most, in the past tense, starting with a verb and naming the thing: "Fixed the scroll jump in the list", "Pushed the new look, 228 tests passing", "Opened PR 8", "Found the leak in the cache". Put the outcome or the number in it where there is one. Separate the actions of a stretch with " ; ".',
+  'Only what was done or found. Leave out reading files, re-running commands, plans, explanations, what will be done next, and anything about how Claude went about it. No sentences, no "Claude" or "you" as the subject, no filler. Fewer actions is better: a stretch that did one thing gets one.',
+  'Report only what the log shows was done or found. What the person asked for is there so you know what the work was for: never report it as done unless the log shows it.',
   '',
   'Reply with one line per stretch:',
-  'N|update',
+  'N|action ; action',
   'where N is the number of the stretch.',
   '',
-  'Then, only if the log shows a big task brought to a finish, add one line for each such task:',
-  'done|N|what was finished, in at most ten words',
-  'where N is the stretch in which it was finished. A big task is a whole piece of work completed: a feature built and working, a problem found and fixed, a round of review applied, something handed over. Steps on the way, partial progress, plans and answers to questions are not big tasks, and most logs have none. Name the thing itself ("Trail mod built and passing its tests"), not the effort.',
-  '',
   'Then, only if the end of the log leaves something waiting on the person, add one line for each such thing:',
-  'wait|N|what they are to do, in at most twenty words',
+  'wait|N|what they are to do, in at most twenty words ::: command or link ;; command or link',
   'where N is the stretch that left it waiting. Something waits on the person when a piece of the work cannot go on, or cannot be finished, until they act: a command only they can run, a sign-in or a permission, an approval, a choice or a question Claude put to them, something to try and report back on. Begin with the verb and say what it unblocks ("Run `gh auth refresh -s workflow` so the packaging branch can be pushed"). An offer of more work, a suggestion, and anything Claude will do by itself are not waiting on them, and most logs leave nothing waiting.',
+  'After " ::: " give what they need to do it with, up to four, separated by " ;; ": the exact command to run, or the link to open (a pull request, a page, a dashboard). Copy each exactly from the log. Where the log names the thing but not the command, give the command only if it is the plain, standard one for that action and tool (merging pull request 13 with the GitHub CLI is "gh pr merge 13"); never guess at flags, names or addresses. With nothing to give, leave " ::: " out.',
   'The log may open with things still waiting on the person from before, marked w1, w2 and so on. Never write a wait line for one of those again. If the log shows that one of them was done or answered, or no longer matters, add a line:',
   'clear|w1',
   'with its mark.',
+  '',
+  'Then, for each picture or file the log marks p1, p2 and so on, add one line:',
+  'pic|p1|what it shows and what it was for, in at most thirty words',
+  'going only by what the log says around it: what the person said as they pasted it, what Claude said it saw in it, what Claude made or sent it for. You cannot see the picture, so never guess at what is in it: if the log does not say, leave the caption empty ("pic|p1|").',
   'Write nothing else.',
 ].join('\n')
 
@@ -89,8 +98,8 @@ const slight = (items: Item[]): Beat[] | undefined => {
   const [answer] = steps
   // An answer that may leave something with the person is read by a model, which says what waits on them.
   if (answer && LEFT_WITH_THEM.test(answer.more ?? answer.line)) return undefined
-  // The answer is the whole of what happened: its start is the update.
-  return answer ? [beatAt(answer, answer.more ?? answer.line)] : []
+  // The answer is the whole of what happened: its first sentence, kept short, is the update.
+  return answer ? [beatAt(answer, clip(answer.line, ANSWER_SHOWN))] : []
 }
 
 /** A turn's steps as stretches, each to be told in one update; a lone last step joins the stretch before it. */
@@ -110,17 +119,32 @@ const stretchesOf = (items: Item[]): Item[][] => {
   return parts.filter(part => part.length > 0)
 }
 
-const entryText = (item: Item, isLast: boolean): string => {
+/** How the log tells of a picture or a file, by where it came from; marked when a caption is wanted for it. */
+const pictureText = (item: Item, mark: string): string => {
+  const marked = mark ? `[${mark}] ` : ''
+  const type = item.shot?.type ?? 'image'
+  if (item.shot?.from === 'person') return `${marked}the person pasted a picture with what they asked`
+  if (item.line.startsWith(SENT)) return `${marked}sent the person ${type === 'video' ? 'a video' : type === 'file' ? 'a file' : 'a picture'}: ${item.line.slice(SENT.length)}`
+  if (type === 'link') return `${marked}published a page: ${item.line.replace(/^Published /, '')}`
+  if (type === 'video') return `${marked}a command made a video: ${item.line}`
+  return `${marked}looked at a picture: ${item.line}`
+}
+
+const entryText = (item: Item, isLast: boolean, mark = ''): string => {
   const did = item.work && workCount(item.work) > 0 ? ` [did: ${[...item.work.notes, workLine(item.work)].join('; ')}]` : ''
-  if (item.kind === 'shot') return `looked at a picture: ${item.line}`
+  if (item.kind === 'shot') return pictureText(item, mark)
   if (item.kind === 'ask') return `(before saying anything)${did}`
   const said = item.more ?? item.line
   return `${item.kind === 'done' && isLast ? 'final answer' : 'said'}: ${said}${did}`
 }
 
-const logOf = (turns: Item[][]): { prompt: string; slots: Item[] } => {
+const logOf = (turns: Item[][]): { prompt: string; slots: Item[]; pics: string[] } => {
   const slots: Item[] = []
+  const pics: string[] = []
   const lines: string[] = []
+  // An output nothing has said anything of yet is marked, for the model to say what the log tells of it. A picture
+  // the person pasted, or one from before the session, is listed nowhere and gets no caption.
+  const markOf = (item: Item): string => (item.kind === 'shot' && item.shot?.note === undefined && item.shot?.from === undefined && pics.length < PICS_MOST ? `p${pics.push(item.id)}` : '')
   for (const items of turns) {
     const ask = items.find(item => item.kind === 'ask')
     if (lines.length > 0) lines.push('')
@@ -132,10 +156,10 @@ const logOf = (turns: Item[][]): { prompt: string; slots: Item[] } => {
     for (const stretch of stretchesOf(shown)) {
       slots.push([...stretch].reverse().find(bearing) ?? stretch[stretch.length - 1]!)
       lines.push(`[${slots.length}]`)
-      for (const item of stretch) lines.push(entryText(item, item === shown[shown.length - 1]))
+      for (const item of stretch) lines.push(entryText(item, item === shown[shown.length - 1], markOf(item)))
     }
   }
-  return { prompt: lines.join('\n'), slots }
+  return { prompt: lines.join('\n'), slots, pics }
 }
 
 /**
@@ -179,45 +203,58 @@ export const nextJob = (trail: Trail, skipped: ReadonlySet<string> = new Set()):
   const isSlight = (items: Item[]): Beat[] | undefined => (open.length > 0 ? undefined : slight(items))
   const told = waiting.filter(items => isSlight(items) === undefined)
   const local = waiting.flatMap(items => isSlight(items) ?? [])
-  if (told.length === 0) return { ids, slots: [], prompt: '', local, isLatest, open: [] }
-  const { prompt, slots } = logOf(told)
+  if (told.length === 0) return { ids, slots: [], prompt: '', local, isLatest, open: [], pics: [] }
+  const { prompt, slots, pics } = logOf(told)
   const still = open.length > 0 ? [STILL_WAITING, ...open.map((beat, index) => `w${index + 1}: ${beat.title}`), '', ''].join('\n') : ''
-  return { ids, slots, prompt: still + clip(prompt, LOG_MAX * 2), ...(local.length > 0 ? { local } : {}), isLatest, open: open.map(beat => beat.id) }
+  return { ids, slots, prompt: still + clip(prompt, LOG_MAX * 2), ...(local.length > 0 ? { local } : {}), isLatest, open: open.map(beat => beat.id), pics }
+}
+
+/**
+ * How many steps have no update and will get none unasked: those of turns
+ * with something already told after them. They went by while the pane was
+ * closed, and are history now that the latest is told.
+ */
+export const backlogOf = (trail: Trail): number => {
+  const told = trail.items.reduce((latest, item) => (item.fed ? Math.max(latest, item.turn) : latest), -1)
+  return trail.items.filter(item => isStep(item) && !item.fed && item.turn < told).length
 }
 
 /** The model's reply as updates: each line it wrote in the form asked for, tied to the last step of the stretch it numbers. */
 export const parseBeats = (reply: string, job: Job): Beat[] => {
   const beats: Beat[] = []
   const told = new Set<number>()
-  let tasks = 0
   let waits = 0
   for (const raw of reply.split('\n')) {
     // Something left waiting on the person: tied to the stretch that left it, and listed apart until it is done.
     const wait = /^\s*[-*]?\s*wait\s*\|\s*\[?(\d+)\]?\s*\|\s*(.+?)\s*$/i.exec(raw)
     if (wait) {
       const left = job.slots[Number(wait[1]) - 1]
-      const what = clip(clean(wait[2]!), WAIT_MAX)
-      if (left && what.length >= 4 && waits < WAITS_MOST) beats.push({ ...beatAt(left, what), id: `w:${left.id}:${waits++}`, kind: 'waiting' })
+      const [said = '', withIt = ''] = wait[2]!.split(/\s+:::\s*/, 2)
+      const what = clip(clean(said), WAIT_MAX)
+      // What they need to do it with: commands to copy and links to open, as the model gave them.
+      const refs = withIt
+        .split(/\s*;;\s*/)
+        .map(ref => clean(ref).replace(/^`+|`+$/g, ''))
+        .filter(ref => ref.length >= 2 && ref.length <= REF_MAX)
+        .slice(0, REFS_MOST)
+      if (left && what.length >= 4 && waits < WAITS_MOST) beats.push({ ...beatAt(left, what), id: `w:${left.id}:${waits++}`, kind: 'waiting', ...(refs.length > 0 ? { refs } : {}) })
       continue
     }
-    if (/^\s*[-*]?\s*clear\s*\|/i.test(raw)) continue
-    // A big task finished: tied to the stretch it was finished in, and listed apart from the updates.
-    const done = /^\s*[-*]?\s*done\s*\|\s*\[?(\d+)\]?\s*\|\s*(.+?)\s*$/i.exec(raw)
-    const where = done ? job.slots[Number(done[1]) - 1] : undefined
-    if (done && where && tasks < TASKS_MOST) {
-      const title = clip(clean(done[2]!).replace(/[.;,]+$/, ''), TASK_MAX)
-      if (title) beats.push({ ...beatAt(where, title), id: `d:${where.id}:${tasks++}`, kind: 'built' })
-      continue
-    }
+    if (/^\s*[-*]?\s*(?:clear|pic)\s*\|/i.test(raw)) continue
     const found = /^\s*[-*]?\s*\[?(\d+)\]?\s*\|\s*(.+?)\s*$/.exec(raw)
     if (!found) continue
     const slot = Number(found[1])
     const at = job.slots[slot - 1]
-    const text = clean(found[2]!)
+    // The actions of the stretch, each kept short and on a line of its own.
+    const actions = found[2]!
+      .split(/\s+;\s+|\s*;\s*$/)
+      .map(action => clip(clean(action).replace(/^[;\s]+|[.;,\s]+$/g, ''), ACTION_MAX))
+      .filter(action => action.length >= 3)
+      .slice(0, ACTIONS_MOST)
     // One update to a stretch; a number that names none, or a line left empty, says nothing.
-    if (!at || told.has(slot) || text.length < 4) continue
+    if (!at || told.has(slot) || actions.join('').length < 4) continue
     told.add(slot)
-    beats.push(beatAt(at, text))
+    beats.push({ ...beatAt(at, ''), title: actions.join('\n') })
   }
   return beats
 }
@@ -233,26 +270,78 @@ export const parseCleared = (reply: string, job: Job): string[] => {
   return [...cleared]
 }
 
+/**
+ * What the model's reply says of the pictures the log marked, by picture: only where it had something to say.
+ * One the log told nothing of keeps no caption, so the conversation itself can still be asked about it.
+ */
+export const parsePictures = (reply: string, job: Job): { id: string; text: string }[] => {
+  const told = new Map<string, string>()
+  for (const raw of reply.split('\n')) {
+    const found = /^\s*[-*]?\s*pic\s*\|\s*\[?p?(\d+)\]?\s*\|\s*(.*?)\s*$/i.exec(raw)
+    const id = found ? job.pics[Number(found[1]) - 1] : undefined
+    const text = found ? clean(found[2]!) : ''
+    if (id && !told.has(id) && text.length >= 4 && !/^[-–—]+$/.test(text)) told.set(id, clip(text, CAPTION_MAX))
+  }
+  return [...told].map(([id, text]) => ({ id, text }))
+}
+
+/** The web page of a repository on GitHub, from its remote as git has it; '' for any other. */
+export const repoPage = (remote: string | null | undefined): string => {
+  const found = /^(?:https?:\/\/(?:[^@/]+@)?github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/.exec((remote ?? '').trim())
+  return found ? `https://github.com/${found[1]}/${found[2]}` : ''
+}
+
+/**
+ * Things waiting on the person that name pull requests by number, with the
+ * link to each added when the session's repository is on GitHub: the number
+ * and the repository are all a link is made of, so it is no guess.
+ */
+export const withPullLinks = (beats: Beat[], remote: string | null | undefined): Beat[] => {
+  const page = repoPage(remote)
+  if (!page) return beats
+  return beats.map(beat => {
+    if (beat.kind !== 'waiting') return beat
+    const numbers: string[] = []
+    for (const named of beat.title.matchAll(/\b(?:PRs?|pull requests?)\s*#?(\d+)((?:\s*(?:,|or|and|&)\s*#?\d+)*)/gi)) {
+      for (const one of [named[1]!, ...[...named[2]!.matchAll(/\d+/g)].map(found => found[0])]) if (!numbers.includes(one)) numbers.push(one)
+    }
+    const had = beat.refs ?? []
+    const links = numbers.map(number => `${page}/pull/${number}`).filter(link => !had.some(ref => ref.replace(/\/$/, '') === link))
+    return links.length > 0 ? { ...beat, refs: [...links, ...had].slice(0, REFS_MOST + links.length) } : beat
+  })
+}
+
 const sameWords = (a: string, b: string): boolean => a.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim() === b.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
 
 /**
  * The trail with the updates in, the steps they tell of marked as told and relieved of what was kept only for
  * the telling. What the reply left waiting on the person is taken only from a log that ran to the latest (an
  * older stretch's is long since dealt with), and what it cleared stops waiting as of the log's last step.
+ * What it said of the pictures becomes their captions.
  */
-export const feedIn = (trail: Trail, job: Job, beats: Beat[], cleared: string[] = []): Trail => {
+export const feedIn = (trail: Trail, job: Job, beats: Beat[], cleared: string[] = [], captions: { id: string; text: string }[] = []): Trail => {
   const covered = new Set(job.ids)
+  const notes = new Map(captions.map(one => [one.id, one.text]))
   const known = new Set(trail.feed.map(beat => beat.id))
   const over = new Set(cleared)
   const overAt = job.slots.reduce((latest, slot) => Math.max(latest, slot.at), 0)
-  const had = trail.feed.map(beat => (over.has(beat.id) && beat.over === undefined ? { ...beat, over: overAt } : beat))
+  // A thing already waiting that the reply tells of again, now with what it is done with, gains that.
+  const gained = (beat: Beat): string[] | undefined =>
+    beat.kind === 'waiting' && beat.over === undefined && !beat.refs?.length ? beats.find(told => told.kind === 'waiting' && told.refs?.length && (told.id === beat.id || sameWords(told.title, beat.title)))?.refs : undefined
+  const had = trail.feed.map(beat => {
+    const refs = gained(beat)
+    const kept = refs ? { ...beat, refs } : beat
+    return over.has(kept.id) && kept.over === undefined ? { ...kept, over: overAt } : kept
+  })
   const stillOpen = had.filter(beat => beat.kind === 'waiting' && beat.over === undefined)
   const fresh = [...(job.local ?? []), ...beats].filter(beat => !known.has(beat.id) && (beat.kind !== 'waiting' || (job.isLatest && !stillOpen.some(other => sameWords(other.title, beat.title)))))
   const feed = [...had, ...fresh].sort((a, b) => a.turn - b.turn || a.at - b.at)
   return {
     ...trail,
     feed: feed.slice(-MAX_BEATS),
-    items: trail.items.map(item => {
+    items: trail.items.map(found => {
+      const note = notes.get(found.id)
+      const item = note !== undefined && found.shot && found.shot.note === undefined ? { ...found, shot: { ...found.shot, note, guess: true as const } } : found
       if (!covered.has(item.id)) return item
       // What was kept only for the telling is let go; a request keeps its words, which are the person's to read back.
       const { more, ...told } = item
@@ -282,7 +371,7 @@ export const adopt = (built: Trail, had: Trail, isRetelling = false): Trail => {
   }
   const told = new Set(had.items.filter(item => item.fed).map(item => item.id))
   for (const item of built.items) if (again.has(item.turn)) told.delete(item.id)
-  const notes = new Map(had.items.flatMap(item => (item.shot?.note === undefined ? [] : [[item.id, item.shot.note] as const])))
+  const notes = new Map(had.items.flatMap(item => (item.shot?.note === undefined ? [] : [[item.id, { note: item.shot.note, ...(item.shot.guess ? { guess: true as const } : {}) }] as const])))
   const turnOf = new Map(built.items.map(item => [item.id, item.turn]))
   const asked = new Map(had.questions.map(question => [question.id, question]))
   const { sought: _, ...rest } = built
@@ -295,7 +384,7 @@ export const adopt = (built: Trail, had: Trail, isRetelling = false): Trail => {
     questions: [...built.questions.map(question => asked.get(question.id) ?? question), ...had.questions.filter(question => !built.questions.some(other => other.id === question.id))].sort((a, b) => a.at - b.at),
     items: built.items.map(found => {
       const note = notes.get(found.id)
-      const item = note !== undefined && found.shot ? { ...found, shot: { ...found.shot, note } } : found
+      const item = note !== undefined && found.shot ? { ...found, shot: { ...found.shot, ...note } } : found
       if (!told.has(item.id)) return item
       const { more, ...kept } = item
       return { ...kept, ...(item.kind === 'ask' && more ? { more } : {}), fed: true as const }

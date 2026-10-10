@@ -14,6 +14,7 @@ export type TrailEvent =
   | { t: 'question'; id: string; at: number; text: string; options: string[]; shot?: Shot }
   | { t: 'answer'; id: string; at: number; text: string }
   | { t: 'caption'; id: string; at: number; text: string }
+  | { t: 'opened'; id: string; at: number }
   | { t: 'end'; at: number; aborted?: boolean }
 
 export const MAX_ITEMS = 400
@@ -87,13 +88,6 @@ export const waitingCount = (trail: Trail): number => trail.questions.filter(que
 /** How a file Claude handed the person is named in the trail. */
 export const SENT = 'Sent you '
 
-/**
- * Whether an entry is something Claude gave the person: a file it sent them,
- * or a page it published. These are what a conversation says "I sent you"
- * about, and what a terminal does not show.
- */
-export const isSent = (item: Item): boolean => item.kind === 'shot' && (item.line.startsWith(SENT) || item.shot?.type === 'link')
-
 /** What kind of output a file is, by its name. */
 export const outputType = (path: string): OutputType => (MOVING.test(path) ? 'video' : STILL.test(path) ? 'image' : 'file')
 
@@ -144,6 +138,24 @@ const plain = (text: string): string =>
       .replace(/\*\*([^*]+)\*\*/g, '$1')
       .replace(/`([^`]+)`/g, '$1')
       .replace(/\[([^\]]+)\]\((?:[^)]+)\)/g, '$1'),
+  )
+
+/** Characters kept of one block of code in what is put to the model. */
+const CODE_KEPT = 300
+
+/**
+ * What was said, flattened for the model that tells of it: as `plain`, but
+ * with what the person may have to act on kept. The commands in its code
+ * blocks stay, each on one line between backticks, and a link keeps where it
+ * leads. Without these the model cannot say what to run or what to open.
+ */
+const telling = (text: string): string =>
+  clean(
+    text
+      .replace(/```(?:[A-Za-z0-9_+-]*\n)?([\s\S]*?)(?:```|$)/g, (_, code: string) => (code.trim() ? ' `' + clip(code.replace(/\s+/g, ' ').trim(), CODE_KEPT) + '` ' : ' '))
+      .replace(/^\s{0,3}(#{1,6}|[-*+]|\d+\.)\s+/gm, '')
+      .replace(/\*\*([^*]+)\*\*/g, '$1')
+      .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, label: string, to: string) => (/^https?:/.test(to) && to !== label ? `${label} (${to})` : label)),
   )
 
 /** What is kept of an answer: all of it, or of a long one its start and its end, the middle left out. */
@@ -380,7 +392,9 @@ const fold = (trail: Trail, event: TrailEvent): Trail => {
           ? change(base.items, before, item => ({ ...item, more: clip(item.more ?? '', STEP_MAX) }))
           : base.items
       const step: Item = { id: event.id, anchor: event.id, kind: 'step', at: event.at, turn: base.turn, line }
-      if (flat.length > line.length) step.more = headAndEnd(flat)
+      // What is kept for the telling has the commands and the links of what was said, which the line shown does not.
+      const told = telling(event.text)
+      if (flat.length > line.length || told !== flat) step.more = headAndEnd(told)
       if (base.lastTool) step.alt = base.lastTool
       return { ...base, items: thin([...items, step]) }
     }
@@ -458,11 +472,20 @@ const fold = (trail: Trail, event: TrailEvent): Trail => {
       questions[index] = { ...questions[index]!, answer: text, answeredAt: event.at }
       return { ...trail, questions }
     }
+    case 'opened': {
+      // `id` is the output's own line: the person has opened it, so it reads as read from now on.
+      const index = trail.items.findIndex(item => item.id === event.id && item.shot !== undefined)
+      if (index < 0) return trail
+      return { ...trail, items: change(trail.items, index, item => ({ ...item, shot: { ...item.shot!, opened: event.at } })) }
+    }
     case 'caption': {
       // `id` is the picture's own line; an empty caption still says the picture was asked about.
       const index = trail.items.findIndex(item => item.id === event.id && item.shot !== undefined)
-      if (index < 0 || trail.items[index]!.shot!.note === event.text) return trail
-      return { ...trail, items: change(trail.items, index, item => ({ ...item, shot: { ...item.shot!, note: event.text } })) }
+      if (index < 0) return trail
+      const { guess: _, ...seen } = trail.items[index]!.shot!
+      if (seen.note === event.text && trail.items[index]!.shot!.guess === undefined) return trail
+      // The conversation saw the picture: what it says replaces what was only made out from the words around it.
+      return { ...trail, items: change(trail.items, index, item => ({ ...item, shot: { ...seen, note: event.text || seen.note || '' } })) }
     }
     case 'end': {
       if (!trail.isOpen) return trail.isFresh ? { ...trail, isFresh: false } : trail

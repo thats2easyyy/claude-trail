@@ -29,9 +29,15 @@ export type OutputType = 'image' | 'video' | 'file' | 'link'
  * was last written as the picture was kept, so it is opened only while it
  * is still that picture, and the small PNG otherwise. `note` is its caption,
  * what it shows and what it was about: absent until the conversation has been
- * asked, empty when it had nothing to say.
+ * asked, empty when it had nothing to say. `guess` marks a caption written
+ * from what was said around the picture by a model that did not see it
+ * (which costs next to nothing): the conversation, which did see it, may
+ * still be asked for a better one. `opened` is when the person last opened
+ * it from the pane: what they have opened reads as read, the rest as new.
+ * Nothing is drawn in the pane and nothing is copied: `file` is empty for
+ * whatever the mod has kept since it stopped keeping pictures.
  */
-export type Shot = { file: string; w: number; h: number; full?: string; stamp?: number; note?: string; type?: OutputType; from?: Source }
+export type Shot = { file: string; w: number; h: number; full?: string; stamp?: number; note?: string; guess?: true; opened?: number; type?: OutputType; from?: Source }
 
 /**
  * Where a picture came from when it is not Claude's own work: the `person`
@@ -102,6 +108,8 @@ export type Beat = {
   alt?: string
   /** Of something waiting on the person: when it stopped waiting, done or no longer needed. Absent while it waits. */
   over?: number
+  /** Of something waiting on the person: what they need to do it with, in order. A link to open (it begins `http`), or a command to run, which is only ever copied. */
+  refs?: string[]
 }
 
 /**
@@ -157,14 +165,13 @@ export type Saved = { v: 5; sid: string; trail: Trail }
 export type Picked = { id: string; jump?: string; isOpen?: boolean }
 
 /**
- * What the pane lists: the feed of updates (its highlights), what Claude
- * sent the person (files it handed over, pages it published), the big tasks
- * done, everything the work produced, every step as it happened, or what
- * waits on the person (`questions`: the questions Claude put to them in the
- * pane and the things the work left for them to do), which is a view only
- * while something does.
+ * What the pane lists: the feed of updates (its highlights), everything the
+ * work produced, each thing the person asked (`steps`, shown as "every
+ * prompt"), or what waits on the person (`questions`: the questions Claude
+ * put to them in the pane and the things the work left for them to do), which
+ * is a view only while something does.
  */
-export type Mode = 'feed' | 'sent' | 'done' | 'outputs' | 'steps' | 'questions'
+export type Mode = 'feed' | 'outputs' | 'steps' | 'questions'
 
 declare module 'claude-code' {
   interface PluginState {

@@ -6,7 +6,7 @@ import { execFileSync } from 'node:child_process'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { feedIn, nextJob, parseBeats, parseCleared, SYSTEM } from '../hooks/digest.ts'
+import { feedIn, nextJob, parseBeats, parseCleared, parsePictures, SYSTEM } from '../hooks/digest.ts'
 import { mended } from '../hooks/trail.ts'
 
 const [where, model = 'haiku', most = '40', show = ''] = process.argv.slice(2)
@@ -27,6 +27,7 @@ let calls = 0
 for (let job = nextJob(trail, skipped); job && calls < Number(most); job = nextJob(trail, skipped)) {
   let beats = job.prompt ? [] : []
   let cleared: string[] = []
+  let captions: { id: string; text: string }[] = []
   if (job.prompt) {
     calls++
     if (show === 'log') console.error(`\n----- log ${calls} (${job.prompt.length} chars)\n${job.prompt}\n-----`)
@@ -34,13 +35,14 @@ for (let job = nextJob(trail, skipped); job && calls < Number(most); job = nextJ
     if (show === 'log') console.error(`----- reply\n${reply}`)
     beats = parseBeats(reply, job)
     cleared = parseCleared(reply, job)
+    captions = parsePictures(reply, job)
     if (beats.length === 0) {
       for (const id of job.ids) skipped.add(id)
       console.error(`unreadable reply: ${reply.slice(0, 200)}`)
       continue
     }
   }
-  trail = feedIn(trail, job, beats, cleared)
+  trail = feedIn(trail, job, beats, cleared, captions)
   writeFileSync(path, JSON.stringify({ ...kept, trail }))
 }
 console.log(JSON.stringify({ calls, highlights: trail.feed.length, waiting: trail.feed.filter(beat => beat.kind === 'waiting' && beat.over === undefined).map(beat => beat.title), stepsLeft: trail.items.filter(item => !item.fed && (item.kind === 'step' || item.kind === 'done')).length }))

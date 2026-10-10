@@ -1,12 +1,12 @@
 // What of the mod's kept data is past keeping. Pure: the hooks module lists the folders and removes what this names.
 //
-// Each session has a folder: its trail (small) and its pictures (nearly all of the size). Three rules, each by age:
-// a whole-size copy of a picture goes a week after it was made (the small copy stays, and is what opens then); a
-// session's pictures all go once it has been idle a week, since a session picked up again has them made anew from
-// its transcript; the whole folder goes when the transcript itself would, after the days Claude Code keeps one.
+// Each session has a folder with its trail in it, which is small. The mod no longer keeps pictures at all (it tells
+// of them in words and opens the file itself), so the `shots` folders that older versions filled are only there to
+// be cleared: a session's goes once it has been idle a day, and a whole-size copy a day after it was made. The
+// folder itself goes when the transcript would, after the days Claude Code keeps one.
 
-/** Days a session may be idle before its pictures are let go. */
-export const PICTURES_DAYS = 7
+/** Days a session may be idle before the pictures an older version kept for it are let go. */
+export const PICTURES_DAYS = 1
 /** Days a session's folder is kept when the person's settings do not say how long transcripts are. */
 export const KEEP_DAYS = 30
 const DAY_MS = 86_400_000
@@ -42,9 +42,8 @@ export const prunable = (kept: readonly Kept[], now: number, own: string, days: 
 
 /**
  * The whole-size copies in one session's pictures that are past keeping: made
- * a week ago or more. Versions before 0.4 copied every picture whole, which
- * was most of what the mod kept; now only a picture that never was a file is
- * copied. Either way the small copy outlives it.
+ * a day ago or more. Versions before 0.4 copied every picture whole, which
+ * was most of what the mod kept; none is made any more.
  */
 export const staleCopies = (files: readonly { name: string; kind: string; mtimeMs: number }[], now: number): string[] =>
   files.filter(file => file.kind === 'file' && WHOLE_COPY.test(file.name) && file.mtimeMs > 0 && now - file.mtimeMs >= PICTURES_DAYS * DAY_MS).map(file => file.name)

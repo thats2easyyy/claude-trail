@@ -1,19 +1,14 @@
-// Reads a session's transcript file back into its trail, pictures included:
+// Reads a session's transcript file back into its trail:
 //   node tools/backfill.ts <session id | path to .jsonl> <out dir>
-// writes <out dir>/trail.json and <out dir>/shots/*.png, and prints one line of JSON saying what it did.
+// writes <out dir>/trail.json, and prints one line of JSON saying what it did. Nothing is copied or converted.
 // The mod runs this for a session that went on without it; it is also the way to look at any past session.
-import { execFileSync } from 'node:child_process'
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, join } from 'node:path'
+import { join } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 
 import { eventsFromRows } from '../hooks/rows.ts'
 import { add, emptyTrail, isEarlier, tag } from '../hooks/trail.ts'
-
-const THUMB_PX = '720'
-/** The newest pictures are worth their file; a session with more keeps the rest as lines. */
-const MOST_PICTURES = 120
 
 const [which, out] = process.argv.slice(2)
 if (!which || !out) {
@@ -32,31 +27,11 @@ const find = (id: string): string | undefined => {
   return undefined
 }
 
-const safeName = (id: string): string => id.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 120)
-
-/** A PNG's size, from its header. */
-const sizeOf = (path: string): { w: number; h: number } => {
-  const head = readFileSync(path).subarray(0, 24)
-  return head.length < 24 ? { w: 0, h: 0 } : { w: head.readUInt32BE(16), h: head.readUInt32BE(20) }
-}
-
 const sid = which.endsWith('.jsonl') ? which.slice(which.lastIndexOf('/') + 1, -'.jsonl'.length) : which
 const file = find(which)
 let trail = emptyTrail()
 let kept = 0
 let skipped = 0
-
-const SUFFIX: Record<string, string> = { 'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif', 'image/webp': '.webp' }
-
-/** Makes the pane's small PNG of a picture; false when the picture will not convert. */
-const thumbOf = (source: string, thumb: string): boolean => {
-  try {
-    execFileSync('/usr/bin/sips', ['-s', 'format', 'png', '-Z', THUMB_PX, source, '--out', thumb], { stdio: 'ignore', timeout: 15_000 })
-    return existsSync(thumb)
-  } catch {
-    return false
-  }
-}
 
 /** A file's lines, read a piece at a time: a long session's transcript is larger than a string may be. */
 function* linesOf(path: string): Generator<string> {
@@ -77,35 +52,21 @@ function* linesOf(path: string): Generator<string> {
 }
 
 if (file) {
-  const { events, pictures, sent, made, opened, asked } = eventsFromRows(linesOf(file), homedir())
+  const { events, sent, made, opened, asked } = eventsFromRows(linesOf(file), homedir())
   const began = events.find(event => event.at > 0)?.at ?? 0
-
-  /** The system's preview of a video or a document, as the pane's small PNG; undefined when it makes none. */
-  const previewOf = (source: string, id: string): string | undefined => {
-    const into = join(out, 'shots', `ql-${safeName(id)}`)
-    const thumb = join(into, `${basename(source)}.png`)
-    if (existsSync(thumb)) return thumb
-    try {
-      mkdirSync(into, { recursive: true })
-      execFileSync('/usr/bin/qlmanage', ['-t', '-s', THUMB_PX, '-o', into, source], { stdio: 'ignore', timeout: 20_000 })
-    } catch {
-      // No preview: the output keeps its line and can still be opened.
-    }
-    return existsSync(thumb) ? thumb : undefined
+  /** A file as it lies, when it is still what it was at `at`: written no later than that. Nothing is copied: it is opened where it is. */
+  const lying = (path: string | undefined, at: number): { full: string; stamp: number } | undefined => {
+    if (path === undefined || !path.startsWith('/') || !existsSync(path)) return undefined
+    const stat = statSync(path)
+    return stat.isFile() && at > 0 && stat.mtimeMs <= at + 2000 ? { full: path, stamp: Math.round(stat.mtimeMs) } : undefined
   }
-  const shots = join(out, 'shots')
-  mkdirSync(shots, { recursive: true })
-  const wanted = new Set([...pictures.keys()].slice(-MOST_PICTURES))
 
   for (const event of events) {
     if (event.t === 'question') {
-      // The picture a question was asked about: the one the mod kept when it was asked, else the file if it is still there.
-      const name = safeName(`q-${event.id}`)
-      const thumb = join(shots, `${name}.png`)
+      // The picture a question was asked about is opened from the question, where it still lies.
       const source = asked.get(event.id)
-      const has = existsSync(thumb) || (source !== undefined && source.startsWith('/') && existsSync(source) && thumbOf(source, thumb))
-      const full = readdirSync(shots).find(other => other.startsWith(`${name}.full.`))
-      trail = add(trail, has ? { ...event, shot: { file: thumb, ...sizeOf(thumb), full: full ? join(shots, full) : (source ?? thumb) } } : event)
+      const there = source !== undefined && source.startsWith('/') && existsSync(source)
+      trail = add(trail, there ? { ...event, shot: { file: '', w: 0, h: 0, full: source } } : event)
       continue
     }
     if (event.t !== 'shot' || event.type === 'link') {
@@ -120,48 +81,22 @@ if (file) {
       // A command that names a video made it only if the file was written while that command ran.
       if (named && (!stat.isFile() || stat.size === 0 || stat.mtimeMs < named.from - 5000 || stat.mtimeMs > named.to + 5000)) continue
       const id = named ? `out:${tag(source)}:${Math.round(stat.mtimeMs)}` : event.id
-      const thumb = previewOf(source, id)
       kept++
-      trail = add(trail, { ...event, id, full: source, ...(thumb ? { file: thumb, ...sizeOf(thumb) } : {}) })
+      trail = add(trail, { ...event, id, file: '', w: 0, h: 0, full: source })
       continue
     }
-    const held = pictures.get(event.id)
-    const name = safeName(event.id)
-    const thumb = join(shots, `${name}.png`)
-    // A picture Claude sent is a file somewhere on disk: the copy the mod made when it was sent, else the file itself.
-    const path = sent.get(event.id)
-    if (!existsSync(thumb) && path !== undefined && path.startsWith('/') && existsSync(path)) thumbOf(path, thumb)
-    // The file the picture was, when it is still on disk as it was when Claude opened or sent it: written no
-    // later than that. It is then opened where it lies, and no copy of it is kept.
-    const lies = path ?? opened.get(event.id)
-    const written = lies !== undefined && lies.startsWith('/') && existsSync(lies) && statSync(lies).isFile() ? statSync(lies).mtimeMs : 0
-    const isAsItWas = written > 0 && event.at > 0 && written <= event.at + 2000
-    // Otherwise the picture as the transcript holds it is kept whole beside its small copy, to open.
-    const whole = join(shots, `${name}.full${SUFFIX[held?.mediaType ?? ''] ?? '.png'}`)
-    if (!existsSync(thumb) && held && wanted.has(event.id)) {
-      try {
-        writeFileSync(whole, Buffer.from(held.base64, 'base64'))
-        if (!thumbOf(whole, thumb) || isAsItWas) rmSync(whole, { force: true })
-      } catch {
-        // A picture that will not convert is left out; the line it would have had is no loss beside the rest.
-        rmSync(whole, { force: true })
-      }
-    }
-    if (!existsSync(thumb)) {
-      skipped++
-      // One too old to be worth its file keeps its line; one that would not convert is left out.
-      if (held && !wanted.has(event.id)) trail = add(trail, event)
-      continue
-    }
-    kept++
-    const full = readdirSync(shots).find(other => other.startsWith(`${name}.full.`))
+    // A picture is told of in words. One that was a file is opened where it lies, while it is still that picture;
+    // one that never was (pasted, a browser's screenshot) has nothing to open.
+    const source = sent.get(event.id) ?? opened.get(event.id)
+    const there = lying(source, event.at)
     // A picture Claude opened that was on disk before the session began was looked at, not made.
-    const source = opened.get(event.id)
     const from = source !== undefined && existsSync(source) && isEarlier(statSync(source).mtimeMs, began) ? { from: 'earlier' as const } : {}
-    trail = add(trail, { ...event, ...from, file: thumb, ...sizeOf(thumb), ...(full ? { full: join(shots, full) } : isAsItWas && lies ? { full: lies, stamp: Math.round(written) } : {}) })
+    if (there) kept++
+    else skipped++
+    trail = add(trail, { ...event, ...from, file: '', w: 0, h: 0, ...(there ?? {}) })
   }
   mkdirSync(out, { recursive: true })
   writeFileSync(join(out, 'trail.json'), JSON.stringify({ v: 5, sid, trail }))
 }
 
-console.log(JSON.stringify({ sid, transcript: file ?? null, lines: trail.items.length, pictures: kept, picturesLeftOut: skipped }))
+console.log(JSON.stringify({ sid, transcript: file ?? null, lines: trail.items.length, toOpen: kept, nothingToOpen: skipped }))
