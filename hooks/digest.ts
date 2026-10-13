@@ -271,8 +271,8 @@ export const parseCleared = (reply: string, job: Job): string[] => {
 }
 
 /**
- * What the model's reply says of the pictures the log marked, by picture: only where it had something to say.
- * One the log told nothing of keeps no caption, so the conversation itself can still be asked about it.
+ * What the model's reply says of the pictures and files the log marked, by each: only where it had something to
+ * say. One the log told nothing of keeps no caption: the model cannot see it, and does not guess.
  */
 export const parsePictures = (reply: string, job: Job): { id: string; text: string }[] => {
   const told = new Map<string, string>()
@@ -341,7 +341,7 @@ export const feedIn = (trail: Trail, job: Job, beats: Beat[], cleared: string[] 
     feed: feed.slice(-MAX_BEATS),
     items: trail.items.map(found => {
       const note = notes.get(found.id)
-      const item = note !== undefined && found.shot && found.shot.note === undefined ? { ...found, shot: { ...found.shot, note, guess: true as const } } : found
+      const item = note !== undefined && found.shot && found.shot.note === undefined ? { ...found, shot: { ...found.shot, note } } : found
       if (!covered.has(item.id)) return item
       // What was kept only for the telling is let go; a request keeps its words, which are the person's to read back.
       const { more, ...told } = item
@@ -371,7 +371,7 @@ export const adopt = (built: Trail, had: Trail, isRetelling = false): Trail => {
   }
   const told = new Set(had.items.filter(item => item.fed).map(item => item.id))
   for (const item of built.items) if (again.has(item.turn)) told.delete(item.id)
-  const notes = new Map(had.items.flatMap(item => (item.shot?.note === undefined ? [] : [[item.id, { note: item.shot.note, ...(item.shot.guess ? { guess: true as const } : {}) }] as const])))
+  const notes = new Map(had.items.flatMap(item => (item.shot?.note === undefined ? [] : [[item.id, item.shot.note] as const])))
   const turnOf = new Map(built.items.map(item => [item.id, item.turn]))
   const asked = new Map(had.questions.map(question => [question.id, question]))
   const { sought: _, ...rest } = built
@@ -384,7 +384,7 @@ export const adopt = (built: Trail, had: Trail, isRetelling = false): Trail => {
     questions: [...built.questions.map(question => asked.get(question.id) ?? question), ...had.questions.filter(question => !built.questions.some(other => other.id === question.id))].sort((a, b) => a.at - b.at),
     items: built.items.map(found => {
       const note = notes.get(found.id)
-      const item = note !== undefined && found.shot ? { ...found, shot: { ...found.shot, ...note } } : found
+      const item = note !== undefined && found.shot ? { ...found, shot: { ...found.shot, note } } : found
       if (!told.has(item.id)) return item
       const { more, ...kept } = item
       return { ...kept, ...(item.kind === 'ask' && more ? { more } : {}), fed: true as const }

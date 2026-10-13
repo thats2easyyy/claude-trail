@@ -13,7 +13,6 @@ export type TrailEvent =
   | { t: 'compact'; id: string; at: number }
   | { t: 'question'; id: string; at: number; text: string; options: string[]; shot?: Shot }
   | { t: 'answer'; id: string; at: number; text: string }
-  | { t: 'caption'; id: string; at: number; text: string }
   | { t: 'opened'; id: string; at: number }
   | { t: 'end'; at: number; aborted?: boolean }
 
@@ -353,7 +352,7 @@ const seenOnce = (trail: Trail, key: string): Trail | null =>
 export const add = (trail: Trail, event: TrailEvent): Trail => {
   const next = fold(trail, event)
   // A caption is written after the fact: it is no sign of when the work last moved.
-  return event.t !== 'caption' && event.at > next.lastAt ? { ...next, lastAt: event.at } : next
+  return event.at > next.lastAt ? { ...next, lastAt: event.at } : next
 }
 
 const fold = (trail: Trail, event: TrailEvent): Trail => {
@@ -477,15 +476,6 @@ const fold = (trail: Trail, event: TrailEvent): Trail => {
       const index = trail.items.findIndex(item => item.id === event.id && item.shot !== undefined)
       if (index < 0) return trail
       return { ...trail, items: change(trail.items, index, item => ({ ...item, shot: { ...item.shot!, opened: event.at } })) }
-    }
-    case 'caption': {
-      // `id` is the picture's own line; an empty caption still says the picture was asked about.
-      const index = trail.items.findIndex(item => item.id === event.id && item.shot !== undefined)
-      if (index < 0) return trail
-      const { guess: _, ...seen } = trail.items[index]!.shot!
-      if (seen.note === event.text && trail.items[index]!.shot!.guess === undefined) return trail
-      // The conversation saw the picture: what it says replaces what was only made out from the words around it.
-      return { ...trail, items: change(trail.items, index, item => ({ ...item, shot: { ...seen, note: event.text || seen.note || '' } })) }
     }
     case 'end': {
       if (!trail.isOpen) return trail.isFresh ? { ...trail, isFresh: false } : trail

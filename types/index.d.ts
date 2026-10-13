@@ -21,23 +21,18 @@ export type Work = {
 export type OutputType = 'image' | 'video' | 'file' | 'link'
 
 /**
- * Something the work produced or looked at, kept for the trail: a small PNG
- * of the mod's own to draw in the pane (a video's or a document's is its
- * preview; `file` is empty where there is none), its shape, and the whole
- * thing to open: a file's path, or a page's address. A picture that is a
- * file on disk is not copied: `full` is the file itself and `stamp` when it
- * was last written as the picture was kept, so it is opened only while it
- * is still that picture, and the small PNG otherwise. `note` is its caption,
- * what it shows and what it was about: absent until the conversation has been
- * asked, empty when it had nothing to say. `guess` marks a caption written
- * from what was said around the picture by a model that did not see it
- * (which costs next to nothing): the conversation, which did see it, may
- * still be asked for a better one. `opened` is when the person last opened
- * it from the pane: what they have opened reads as read, the rest as new.
- * Nothing is drawn in the pane and nothing is copied: `file` is empty for
- * whatever the mod has kept since it stopped keeping pictures.
+ * Something the work produced or looked at, noted for the trail. Nothing is
+ * drawn in the pane and nothing is copied: it is told of in words and opened
+ * where it lies. `full` is the thing itself, a file's path or a page's
+ * address, and `stamp` when that file was last written as it was noted, so
+ * it is opened only while it is still that file; a picture that never was a
+ * file has neither. `note` is its caption, written with the update from what
+ * was said around it, by a model that does not see it. `opened` is when the
+ * person last opened it from the pane: what they have opened reads as read,
+ * the rest as new. `file`, `w` and `h` are a small copy and its shape, which
+ * versions before 0.5 kept; they are empty now.
  */
-export type Shot = { file: string; w: number; h: number; full?: string; stamp?: number; note?: string; guess?: true; opened?: number; type?: OutputType; from?: Source }
+export type Shot = { file: string; w: number; h: number; full?: string; stamp?: number; note?: string; opened?: number; type?: OutputType; from?: Source }
 
 /**
  * Where a picture came from when it is not Claude's own work: the `person`

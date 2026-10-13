@@ -2,7 +2,6 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { captionJob, parseCaptions } from '../hooks/caption.ts'
 import { adopt, feedIn, nextJob, parseBeats, parseCleared, parsePictures, repoPage, withPullLinks } from '../hooks/digest.ts'
 import { candidates, reach } from '../hooks/jump.ts'
 import { keepDays, prunable, sized, staleCopies } from '../hooks/prune.ts'
@@ -413,30 +412,21 @@ test('work is put to a model as a log divided into stretches, and its reply beco
   expect(nextJob(told)).toBeNull()
 })
 
-test('a picture gets a caption from the words around it for next to nothing, and the conversation that saw it can still better it', () => {
+test('a picture gets its caption from the words around it, in the same call as the update', () => {
   const trail = folded(WORKED)
   const job = nextJob(trail)!
   expect(job.pics).toEqual(['t4:shot'])
   const reply = '1|The boss fight was made playable.\npic|p1|The second phase of the boss fight, opened to check the new attack patterns.\npic|p2|There is no second picture\npic|p1|Said twice'
-  // What is said of a picture is no update: it is the picture's caption, marked as made out from the log and not from the picture.
+  // What is said of a picture is no update: it is the picture's caption.
   expect(parseBeats(reply, job).map(beat => beat.id)).toEqual(['b:s2'])
   expect(parsePictures(reply, job)).toEqual([{ id: 't4:shot', text: 'The second phase of the boss fight, opened to check the new attack patterns.' }])
   // A log that says nothing of a picture leaves it without one, never a guess at what is in it.
   expect(parsePictures('1|Done.\npic|p1|\npic|p1|—', job)).toEqual([])
   const told = feedIn(trail, job, parseBeats(reply, job), [], parsePictures(reply, job))
   const shot = () => told.items.find(item => item.id === 't4:shot')?.shot
-  expect([shot()?.note, shot()?.guess]).toEqual(['The second phase of the boss fight, opened to check the new attack patterns.', true])
-  // Such a caption is still one the conversation may be asked to better; its own answer replaces it and is final.
-  const again = captionJob(told, () => '00:00')
-  expect(again?.shots.map(item => item.id)).toEqual(['t4:shot'])
-  const seen = add(told, { t: 'caption', id: 't4:shot', at: 9500, text: 'Phase two with the boss at half health and the new sweep attack mid-swing.' })
-  expect([seen.items.find(item => item.id === 't4:shot')?.shot?.note, seen.items.find(item => item.id === 't4:shot')?.shot?.guess]).toEqual(['Phase two with the boss at half health and the new sweep attack mid-swing.', undefined])
-  expect(captionJob(seen, () => '00:00')).toBeNull()
-  // A conversation that cannot find the picture leaves the caption it had, and is not asked again.
-  const lost = add(told, { t: 'caption', id: 't4:shot', at: 9500, text: '' })
-  expect([lost.items.find(item => item.id === 't4:shot')?.shot?.note?.startsWith('The second phase'), lost.items.find(item => item.id === 't4:shot')?.shot?.guess, captionJob(lost, () => '00:00')]).toEqual([true, undefined, null])
-  // Read back from its transcript, a trail keeps the caption and that it was only made out from the log.
-  expect(adopt(folded(WORKED), told).items.find(item => item.id === 't4:shot')?.shot).toMatchObject({ note: shot()?.note, guess: true })
+  expect(shot()?.note).toBe('The second phase of the boss fight, opened to check the new attack patterns.')
+  // Read back from its transcript, a trail keeps the caption.
+  expect(adopt(folded(WORKED), told).items.find(item => item.id === 't4:shot')?.shot).toMatchObject({ note: shot()?.note })
 })
 
 test('a question with no work in it needs no model, and a long run is told of a stretch at a time as it goes', () => {
@@ -618,47 +608,6 @@ test('a trail read back from its transcript keeps the updates and the answers on
   expect([asked.sought, adopt(built, asked).sought, adopt(built, before).sought, adopt(built, before, true).sought, mended(JSON.parse(JSON.stringify(before)))?.sought]).toEqual([true, true, undefined, true, undefined])
   // Only the turn nobody summarised is left to tell.
   expect(nextJob(kept)?.ids).toEqual(['p0', 's0'])
-})
-
-test('each picture is asked about by what the conversation can tell it by, and the answer becomes its caption', () => {
-  const trail = folded([
-    { t: 'prompt', id: 'p1', at: Date.parse('2026-10-03T20:35:00Z'), text: 'the highlights view does not make sense as is, it should just be a short summary' },
-    { t: 'shot', id: 'p1:1', at: Date.parse('2026-10-03T20:35:00Z'), anchor: 'p1', file: '/shots/a.png', w: 10, h: 10, label: 'You pasted a picture' },
-    { t: 'shot', id: 'p1:2', at: Date.parse('2026-10-03T20:35:00Z'), anchor: 'p1', file: '/shots/b.png', w: 10, h: 10, label: 'You pasted a picture' },
-    { t: 'shot', id: 't1', at: Date.parse('2026-10-03T20:40:00Z'), anchor: 't1', file: '/shots/c.png', w: 10, h: 10, label: 'pane.png' },
-    { t: 'shot', id: 't2:0', at: Date.parse('2026-10-03T20:41:00Z'), anchor: 't2', file: '/shots/d.png', w: 10, h: 10, label: 'Sent you town.png' },
-    { t: 'end', at: Date.parse('2026-10-03T20:42:00Z') },
-  ])
-  const job = captionJob(trail, at => new Date(at).toISOString().slice(11, 16))!
-  expect(job.shots.map(shot => shot.id)).toEqual(['p1:1:shot', 'p1:2:shot', 't1:shot', 't2:0:shot'])
-  expect(job.prompt.split('\n').filter(line => /^\d\./.test(line))).toEqual([
-    '1. a picture the person pasted at 20:35, with their message beginning "the highlights view does not make sense as is, it should just be a short summary" (picture 1 of 2 in that message)',
-    '2. a picture the person pasted at 20:35, with their message beginning "the highlights view does not make sense as is, it should just be a short summary" (picture 2 of 2 in that message)',
-    '3. the picture pane.png, which you opened at 20:40',
-    '4. the picture town.png, which you sent the person at 20:41',
-  ])
-
-  const told = parseCaptions(['1|Your screenshot of the highlights view. You said it does not make sense and should be a short summary.', '2|-', '3. The pane as drawn in a preview, to check the picture fits.', 'chatter'].join('\n'), job)
-  expect(told).toEqual([
-    { id: 'p1:1:shot', text: 'Your screenshot of the highlights view. You said it does not make sense and should be a short summary.' },
-    // Not found, or not answered for: asked about, and not asked about again.
-    { id: 'p1:2:shot', text: '' },
-    { id: 't1:shot', text: 'The pane as drawn in a preview, to check the picture fits.' },
-    { id: 't2:0:shot', text: '' },
-  ])
-  // An answer in no form at all leaves the pictures to be asked about another time.
-  expect(parseCaptions('I cannot help with that.', job)).toEqual([])
-
-  const captioned = told.reduce((now, one) => add(now, { t: 'caption', id: one.id, at: 1, text: one.text }), trail)
-  expect(captioned.items.filter(item => item.kind === 'shot').map(item => item.shot?.note)).toEqual([told[0]!.text, '', told[2]!.text, ''])
-  expect(captionJob(captioned, () => '')).toBeNull()
-  // The caption reads under the output's name, and it outlives the trail being read back from its transcript.
-  const row = layout(captioned, { width: 58, picked: NOBODY, page: 0, mode: 'outputs', zone: 0 }).rows.find(found => found.kind === 'line' && found.key === 't1:shot')
-  expect(row?.kind === 'line' && row.lines.slice(1).join(' ')).toBe(told[2]!.text)
-  expect(adopt(trail, captioned).items.find(item => item.id === 't1:shot')?.shot?.note).toBe(told[2]!.text)
-  // Pictures from before the context was compacted are no longer the conversation's to describe.
-  const compacted = add(trail, { t: 'compact', id: 'c1', at: Date.parse('2026-10-03T21:00:00Z') })
-  expect(captionJob(compacted, () => '')).toBeNull()
 })
 
 test('whatever the work produced is an output: pictures, the videos a command made, files handed over, pages published', () => {
@@ -1150,7 +1099,7 @@ test('a closed pane costs nothing; opened, it writes the latest of what was miss
   expect(asked).toHaveLength(before)
 })
 
-test('a picture is captioned from the log along with the update; the conversation is asked what it shows only on /trail describe', async ($, on) => {
+test('a picture is captioned from the log along with the update; the conversation itself is never asked what it shows', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const { asked, forked, made, showing } = engine(on, '1|Opened the login form: it renders\npic|p1|The login form, opened to check it renders.', '1|The login form with both fields empty and the Sign in button greyed out.')
   made.add('/work/shots/login.png')
@@ -1178,16 +1127,9 @@ test('a picture is captioned from the log along with the update; the conversatio
   await ui.press({ key: 'tab:feed' })
   await ui.unmount()
 
-  // Asked for, the conversation says what the picture shows, and that replaces the caption made out from the log.
-  expect((await typed('describe')).text).toBe('Trail asked the conversation what its pictures show: 1 captioned.')
-  expect(forked).toHaveLength(1)
-  const after = await $.ui.mount(pane('terminal'))
-  await after.press({ key: 'tab:outputs' })
-  expect(await after.find({ type: 'Text', text: /The login form with both fields empty and the Sign in/ })).toBeDefined()
-  expect(await after.find({ type: 'Text', text: /opened to check it renders/ })).toBeUndefined()
-  await after.unmount()
-  expect((await typed('describe')).text).toBe('Every recent picture already has a caption from the conversation itself.')
-  expect(forked).toHaveLength(1)
+  // There is no way to ask the conversation itself: the only commands are to open the pane and to close it.
+  expect((await typed('describe')).text).toContain('Usage: /trail')
+  expect(forked).toHaveLength(0)
 })
 
 test('a session nobody is at (claude -p, a script) is not noted, kept or put to a model', async ($, on) => {

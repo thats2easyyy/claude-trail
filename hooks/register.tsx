@@ -3,7 +3,6 @@ import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import type { Beat, Mode, OutputType, Picked, Question, Saved, Shot, Source, Trail } from '../types'
 import { adopt, backlogOf, feedIn, nextJob, parseBeats, parseCleared, parsePictures, SYSTEM, withPullLinks } from './digest.ts'
-import { captionJob, parseCaptions } from './caption.ts'
 import { candidates, reach } from './jump.ts'
 import { isSession, keepDays, prunable, sized, staleCopies } from './prune.ts'
 import type { Kept } from './prune.ts'
@@ -53,7 +52,7 @@ const COPIES_AT_ONCE = 40
 const OPEN = '/usr/bin/open'
 const DATE = '/bin/date'
 const REBUILD_MS = 120_000
-const USAGE = 'Usage: /trail [close|describe|rebuild|where]'
+const USAGE = 'Usage: /trail to open the pane, /trail close to close it'
 const OPENED = 'Trail opened. Point at an entry and click the arrow beside its time to jump to it in the conversation.'
 /**
  * The way to an entry's place in the conversation: an arrow beside its time,
@@ -71,7 +70,6 @@ const DIGEST_NEXT_MS = 300
 const DIGEST_RETRY_MS = 60_000
 const DIGEST_TIMEOUT_MS = 90_000
 const DIGEST_TOKENS = 1400
-/** Captions are asked for a little after a turn ends, while the conversation is fresh in the provider's cache. */
 /**
  * The session's own model writes the updates: a stretch is a page of log and a few lines of reply, and a
  * small model was seen to report what was asked for as done. The small one stands in where the session's cannot be asked.
@@ -159,7 +157,6 @@ const watched = async ($: Dollar): Promise<boolean> => {
   }
   return !isUnwatched
 }
-let isCaptioning = false
 
 /** Questions the person has answered in the pane: a second press before the pane is drawn again sends nothing more. */
 const answered = new Set<string>()
@@ -174,7 +171,6 @@ const diag = {
   shots: [] as string[],
   rebuilds: [] as string[],
   digests: [] as string[],
-  captions: [] as string[],
   questions: [] as string[],
   prunes: [] as string[],
   faults: [] as string[],
@@ -321,51 +317,12 @@ const digestSoon = ($: Dollar, ms: number) => {
   })
 }
 
-/**
- * Asks the conversation itself what its pictures show and what they were
- * about, and sets the answers under them. The question is put over the whole
- * transcript, so it is asked only just after a turn has ended, when the
- * provider still has that transcript at hand, and for all the pictures at once.
- */
+/** Whether the person has the pane in front of them: the one condition under which a model is asked for anything. */
 const isPaneShown = ($: Dollar): Promise<boolean> =>
   $.ui.panes().then(
     panes => panes.some(pane => pane.id === PANE && pane.isShown),
     () => false,
   )
-
-/**
- * Asks the conversation itself what its pictures show, which is the one call
- * that sees them and the one that costs: it reads the whole conversation
- * again. So it is never made unasked: only when the person types
- * `/trail describe`. Otherwise a picture keeps the caption the update's model
- * made out from the words around it, which costs next to nothing. Resolves
- * how many pictures it captioned, or null when it could not ask.
- */
-const caption = async ($: Dollar): Promise<number | null> => {
-  if (isCaptioning || isRebuilding || !sid) return null
-  const job = captionJob(live, at => clock(at, zone))
-  if (!job) return 0
-  const of = sid
-  isCaptioning = true
-  try {
-    const reply = await $.model.fork({ prompt: job.prompt })
-    if (of !== sid) return null
-    if (!reply.isAnswered) {
-      jot(diag.captions, `no answer: ${reply.reason}`)
-      return null
-    }
-    const told = parseCaptions(reply.text, job)
-    jot(diag.captions, `${told.filter(one => one.text).length} of ${job.shots.length} captioned, cache read ${reply.usage.cache_read_input_tokens}, in ${reply.usage.input_tokens}, out ${reply.usage.output_tokens}`)
-    for (const one of told) await record($, now => ({ t: 'caption', id: one.id, at: now, text: one.text }))
-    await push($, true)
-    return told.filter(one => one.text).length
-  } catch (error) {
-    fault($, 'caption', error)
-    return null
-  } finally {
-    isCaptioning = false
-  }
-}
 
 const load = async ($: Dollar): Promise<Trail | null> => {
   try {
@@ -938,7 +895,7 @@ export const register: Register = on => {
     await $.command.register({
       name: 'trail',
       description: 'Show what this conversation did as a feed in a side pane; click a line to jump there',
-      argumentHint: '[close|describe|rebuild|where]',
+      argumentHint: '[close]',
       immediate: true,
     })
     await $.tool.register({ name: 'ask', description: ASK_DESCRIPTION, inputSchema: ASK_SCHEMA })
@@ -964,11 +921,6 @@ export const register: Register = on => {
       return { text: 'Trail closed.' }
     }
     if (verb === 'where') return { text: `Trail keeps this session in ${dir}${await keptSize($)}` }
-    if (verb === 'describe') {
-      // The person asks for it, knowing what it costs: the conversation reads itself again to say what its pictures show.
-      const count = await caption($)
-      return { text: count === null ? 'Trail could not ask the conversation about its pictures just now. Try again once it is at rest.' : count === 0 ? 'Every recent picture already has a caption from the conversation itself.' : `Trail asked the conversation what its pictures show: ${count} captioned.` }
-    }
     if (verb === 'rebuild') {
       const why = await rebuild($, true)
       if (why) return { text: `Trail could not read the transcript back: ${why}` }

@@ -52,9 +52,6 @@ To get a newer version later, run `claude plugin update trail@claude-trail` in y
 | --- | --- |
 | `/trail` | Opens the pane and writes the latest updates |
 | `/trail close` | Closes it, and keeps it closed in new sessions until you type `/trail`. A closed pane uses no tokens |
-| `/trail describe` | Asks the conversation what its recent pictures show (expensive: see what it costs) |
-| `/trail rebuild` | Reads the whole conversation again from its transcript, and looks again at the latest of it for what is waiting on you |
-| `/trail where` | Says where this session's trail is kept and how much disk the mod is using |
 
 In a terminal at least 144 columns wide the pane opens by itself when a session starts. A conversation that began before you installed the mod is read back from its transcript the next time you resume it.
 
@@ -70,15 +67,16 @@ That is the only call it makes by itself.
 
 **When you open the pane later**, one call writes the latest of what you missed, including what is waiting on you. Anything further back stays unsummarised until you press `[summarise]`.
 
-`/trail describe` asks the conversation itself what its recent pictures show. That gives a better description, but it re-reads the whole conversation, which in a long one is hundreds of thousands of tokens, so it only ever happens when you type it.
-
-A session nobody is at (`claude -p`, a script) is ignored entirely.
-
 ## What it keeps on disk
 
 One small file per conversation, in `~/.claude/trail/<session id>/`: its trail, a few kilobytes of text. No pictures or copies of files are kept.
 
 A conversation's folder is removed once it has been idle for as long as Claude Code keeps transcripts (`cleanupPeriodDays` in your settings, 30 days by default). Versions before 0.5 kept copies of pictures there; those are removed once a conversation has been idle a day. The cleanup runs once a day, from whichever session starts first.
+
+## If something looks wrong
+
+- `/trail rebuild` reads the whole conversation again from its transcript and looks again at the latest of it for what is waiting on you.
+- `/trail where` says where this session's trail is kept and how much disk the mod is using.
 
 ## Working on it
 
