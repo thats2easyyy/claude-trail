@@ -1032,10 +1032,33 @@ test('once a day a starting session clears what other sessions left that is past
   // In a session that stays, only the whole-size copies made a day ago or more go.
   expect(ran.filter(([command, flag]) => command === '/bin/rm' && flag === '-f' && String(ran).includes('.full.'))).toContainEqual(['/bin/rm', '-f', `${root}/${recent}/shots/toolu_a.full.png`])
   expect(ran.flat().some(arg => arg.endsWith('toolu_a.png') || arg.endsWith('toolu_b.full.png'))).toBe(false)
+  // The note of what the mod saw, which older versions wrote every turn, goes from the other sessions that stay, never from this one.
+  expect(ran).toContainEqual(['/bin/rm', '-f', `${root}/${recent}/diag.json`, `${root}/${idle}/diag.json`])
+  expect(ran.flat().some(arg => arg === `${root}/${SID}/diag.json`)).toBe(false)
   // It is done once a day, whichever session comes to it: the module starting again does not do it again.
   await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
   await clock.advance(10_000)
   expect(removed()).toHaveLength(2)
+})
+
+test('a conversation keeps one file, its trail; what the mod saw is put on disk only when /trail where asks', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const { files, showing } = engine(on, '1|Made the login work')
+  const typed = (args: string) => $.command.run({ command: 'trail', args, origin: PERSON, presentation: { isFullscreen: true, columns: 200 } })
+
+  await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+  await appended($.session.append(ask('row-ask', 'make the login flow work end to end')))
+  await appended($.session.append(say('row-done', 'Login works end to end and every test passes.')))
+  showing.pane = true
+  await $.turn.complete({ answer: 'Login works.', durationMs: 5, isAborted: false, turnId: 't1', reason: 'answer' })
+  await clock.advance(10_000)
+  // A turn told and saved leaves the trail and nothing beside it.
+  expect([...files.keys()].filter(path => path.startsWith(`${DIR}/`))).toEqual([`${DIR}/trail.json`])
+
+  const said = await typed('where')
+  expect(said.text).toContain(`Trail keeps this session in ${DIR}`)
+  expect(said.text).toContain(`${DIR}/diag.json`)
+  expect(JSON.parse(files.get(`${DIR}/diag.json`) ?? '{}')).toMatchObject({ sid: SID })
 })
 
 test('a closed pane costs nothing; opened, it writes the latest of what was missed, and what is further back only when asked', async ($, on) => {

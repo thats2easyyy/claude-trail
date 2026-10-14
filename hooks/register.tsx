@@ -164,7 +164,7 @@ const answered = new Set<string>()
 /** A folded run's id in the transcript, by each tool call in it: what a jump to a folded call scrolls to. */
 const groupsByCall = new Map<string, string>()
 
-/** What the mod saw, for whoever is working on it: written beside the trail as diag.json. */
+/** What the mod saw, for whoever is working on it. Kept in memory: it is put on disk, beside the trail as diag.json, only when `/trail where` asks. */
 const diag = {
   appends: [] as string[],
   jumps: [] as string[],
@@ -195,7 +195,19 @@ const save = async ($: Dollar, now: number) => {
   lastSavedAt = now
   const kept: Saved = { v: 5, sid, trail: live }
   await $.fs.write(`${dir}/trail.json`, JSON.stringify(kept))
-  await $.fs.write(`${dir}/diag.json`, JSON.stringify({ at: now, sid, zone, items: live.items.length, updates: live.feed.length, model: digestModel, ...diag }, null, 1))
+}
+
+/** Writes what the mod saw beside the trail, for `/trail where`, and says where: the one time it is put on disk. */
+const noteDiag = async ($: Dollar): Promise<string> => {
+  if (!sid || !dir) return ''
+  try {
+    const now = await $.clock.now()
+    await $.fs.write(`${dir}/diag.json`, JSON.stringify({ at: now, sid, zone, items: live.items.length, updates: live.feed.length, model: digestModel, ...diag }, null, 1))
+    return `${dir}/diag.json`
+  } catch (error) {
+    fault($, 'diag', error)
+    return ''
+  }
 }
 
 /** Hands the trail to the session's state, which draws the pane again, and to its file when that is due. */
@@ -377,11 +389,12 @@ const rebuild = async ($: Dollar, isAsked = false): Promise<string> => {
 
 /**
  * Removes what the mod kept for other sessions that is past keeping: the
- * pictures of one idle a week, the whole folder of one idle as long as Claude
- * Code keeps a transcript, and in those that stay the whole-size copies made
- * a week ago or more. Once a day at most, whichever session comes to it
- * first, and never this session's own. Only folders the mod made, named by a
- * session's id inside the mod's own folder, are ever removed.
+ * pictures of one idle a day, the whole folder of one idle as long as Claude
+ * Code keeps a transcript, in those that stay the whole-size copies made a
+ * day ago or more, and the note of what the mod saw (diag.json). Once a day
+ * at most, whichever session comes to it first, and never this session's
+ * own. Only what the mod made, in folders named by a session's id inside the
+ * mod's own folder, is ever removed.
  */
 const prune = async ($: Dollar) => {
   try {
@@ -406,7 +419,10 @@ const prune = async ($: Dollar) => {
     const { folders, pictures } = prunable(kept, now, sid, keepDays(settings['cleanupPeriodDays']))
     for (const name of folders) await $.process.run([RM, '-rf', `${root}/${name}`], { timeoutMs: 60_000 })
     for (const name of pictures) await $.process.run([RM, '-rf', `${root}/${name}/shots`], { timeoutMs: 60_000 })
-    // In the sessions that stay, this one included, a whole-size copy goes a week after it was made.
+    // The note of what the mod saw, which versions before 0.5.2 wrote every turn, goes from every other session that stays.
+    const notes = kept.filter(one => isSession(one.name) && one.name !== sid && !folders.includes(one.name)).map(one => `${root}/${one.name}/diag.json`)
+    for (let from = 0; from < notes.length; from += COPIES_AT_ONCE) await $.process.run([RM, '-f', ...notes.slice(from, from + COPIES_AT_ONCE)], { timeoutMs: 60_000 })
+    // In the sessions that stay, this one included, a whole-size copy goes a day after it was made.
     let copies = 0
     for (const one of kept) {
       if (!isSession(one.name) || !one.hasShots || folders.includes(one.name) || pictures.includes(one.name)) continue
@@ -920,7 +936,10 @@ export const register: Register = on => {
       await $.ui.close({ id: PANE })
       return { text: 'Trail closed.' }
     }
-    if (verb === 'where') return { text: `Trail keeps this session in ${dir}${await keptSize($)}` }
+    if (verb === 'where') {
+      const noted = await noteDiag($)
+      return { text: `Trail keeps this session in ${dir}${await keptSize($)}${noted ? `\nWhat it saw this session is written to ${noted}` : ''}` }
+    }
     if (verb === 'rebuild') {
       const why = await rebuild($, true)
       if (why) return { text: `Trail could not read the transcript back: ${why}` }

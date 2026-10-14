@@ -69,14 +69,16 @@ That is the only call it makes by itself.
 
 ## What it keeps on disk
 
-One small file per conversation, in `~/.claude/trail/<session id>/`: its trail, a few kilobytes of text. No pictures or copies of files are kept.
+One file per conversation, in `~/.claude/trail/<session id>/`: its trail, as text. It is a few kilobytes for most conversations and a few hundred for a very long one. No pictures or copies of files are kept.
 
-A conversation's folder is removed once it has been idle for as long as Claude Code keeps transcripts (`cleanupPeriodDays` in your settings, 30 days by default). Versions before 0.5 kept copies of pictures there; those are removed once a conversation has been idle a day. The cleanup runs once a day, from whichever session starts first.
+A conversation's folder is removed once it has been idle for as long as Claude Code keeps transcripts (`cleanupPeriodDays` in your settings, 30 days by default). The cleanup runs once a day, from whichever session starts first.
+
+Older versions kept more, and the same cleanup clears it: the copies of pictures that versions before 0.5 made go once a conversation has been idle a day, and the diagnostics note (`diag.json`) that versions before 0.5.2 wrote every turn goes from every conversation but the one you are in.
 
 ## If something looks wrong
 
 - `/trail rebuild` reads the whole conversation again from its transcript and looks again at the latest of it for what is waiting on you.
-- `/trail where` says where this session's trail is kept and how much disk the mod is using.
+- `/trail where` says where this session's trail is kept and how much disk the mod is using. It also writes a diagnostics note (`diag.json`) beside the trail, which is the only time one is written; send it along when reporting a problem.
 
 ## Working on it
 
